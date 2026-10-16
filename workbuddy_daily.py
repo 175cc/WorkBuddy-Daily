@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🌱 WorkBuddy Daily - 全能签到脚本 v3.10
+🌱 WorkBuddy Daily - 全能签到脚本 v3.11
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -2021,7 +2021,7 @@ def t_compensation(s, log):
     url = BASE + "/billing/meter/compensation-status"
 
     def status():
-        response = s.post(url, json={}, timeout=15).json()
+        response = s.post(url, json={}, timeout=15, verify=False).json()
         if response.get("code") != 0 or not isinstance(response.get("data"), dict):
             raise ValueError("补偿状态接口未返回有效数据")
         return response["data"]
@@ -2042,7 +2042,7 @@ def t_compensation(s, log):
     log("   🎊补偿待领取: %s积分%s" % (credit, "（截止%s）" % deadline if deadline else ""))
     try:
         result = s.post(BASE + "/billing/meter/claim-compensation",
-                        json={}, timeout=15).json()
+                        json={}, timeout=15, verify=False).json()
     except Exception as exc:
         log("   ⚠️补偿领取请求异常: %s" % type(exc).__name__)
         result = {}
