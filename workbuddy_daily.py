@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🌱 WorkBuddy Daily - 全能签到脚本 v3.8
+🌱 WorkBuddy Daily - 全能签到脚本 v3.10
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -1069,6 +1069,9 @@ def t_sign(s, uid, nick, log):
     try:
         d = api_retry(s, "POST", BASE + "/v2/billing/meter/daily-checkin", body={},
                       retries=3, gap=2.0).json()
+        if is_enterprise_denial(None, d):
+            log("   🏢 企业版账号：上游不支持签到与个人成长任务（本次跳过）")
+            return
         if d.get("code") in (0, 200):
             credit = (d.get("data") or {}).get("credit")
         msg = (d.get("msg") or "")[:40]
@@ -2897,6 +2900,30 @@ def _accept_with_verify(s, code, log):
 
 
 # ---------- 单账号全流程 ----------
+def is_enterprise_denial(status_code, payload):
+    """企业版账号「无个人成长体系」判定（上游 2026-10-07 A/B 实测口径，panel 仓库同款）。
+
+    企业号：GET /activity/growth/* 与 /v2/activity/growth/tasks 一律 403
+    「growth system is only available for personal users」；签到 / claim-gift /
+    claim-compensation 走 400 code 10001「企业账号不支持该操作」。
+    命中即按企业版处理：跳过签到与全部成长/互动任务，不再误报「凭据失效」。
+    """
+    if isinstance(payload, dict):
+        try:
+            blob = json.dumps(payload, ensure_ascii=False).lower()
+        except Exception:
+            blob = str(payload).lower()
+    else:
+        blob = str(payload or "").lower()
+    if status_code == 403:
+        return (("growth system" in blob) or ("personal user" in blob)
+                or ("成长" in blob and "个人" in blob))
+    code = payload.get("code") if isinstance(payload, dict) else None
+    if status_code in (400, None) and code == 10001:
+        return ("企业" in blob) or ("enterprise" in blob)
+    return False
+
+
 def run_account(idx, acc, do_desktop):
     msgs = []
     tag = "账号%d" % idx
@@ -2921,16 +2948,24 @@ def run_account(idx, acc, do_desktop):
 
     log("")
     log("╭─ 👤 账号%d  %s" % (idx, mask_phone(acc.get("note", ""))))
-    # 查询
-    credits, paid = queryCredits(s)
-    usage = queryUsage(s)
+    # 先探成长域：企业版账号在这里就能识别（无个人成长体系），
+    # 避免把上游 403 误报成「凭据失效」、也避免对注定被拒的端点空发请求。
     rp = s.get(BASE + "/v2/activity/growth/profile", timeout=25, verify=False)
     pj = _json_or_empty(rp)
     if rp.status_code in (401, 403) or not pj:
+        if is_enterprise_denial(rp.status_code, pj):
+            log("  🏢 企业版账号：无个人成长体系（上游对签到/成长端点一律拒绝，实测口径）")
+            log("     已跳过签到与全部成长/互动任务；积分额度请在企业后台或企业接口查询")
+            summary["enterprise"] = True
+            summary["rest"] = ["企业版账号（无个人成长体系）"]
+            return msgs, summary
         log("  ❌ 凭据失效（HTTP %s）：AT/RT 已过期或被轮换 —— 请重新登录桌面端，或用 workbuddy_login.py" % rp.status_code)
         log("     重新获取一行「手机号:AT:RT」后更新变量，本账号本次跳过（不影响其他账号）")
         return msgs, {"idx": idx, "note": acc.get("note", ""), "done": 0, "total": 0,
                       "rest": ["凭据失效"], "level": "?", "energy": "?"}
+    # 查询
+    credits, paid = queryCredits(s)
+    usage = queryUsage(s)
     prof = pj.get("data", {}) or {}
     energy = (_json_or_empty(s.get(BASE + "/v2/activity/growth/energy", timeout=25,
                                             verify=False)).get("data") or {}).get("balance")
