@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """daily_forward.py — 把国内版 WorkBuddy Daily 的签到结果转发到微信（WxPusher）。
 
-为什么需要它
-------------
-国内版脚本 workbuddy_daily.py 是**上游文件**（sync-upstream 的 mirror 策略会覆盖本地修改），
-它原生只支持 Bark / PushPlus / 企业微信 / 钉钉，没有 WxPusher。
-本脚本在 workbuddy.yml 跑完后读取它的运行日志，重建「签到报告」并转发到微信，
-从而在不改动上游文件的前提下让签到通知也走 WxPusher。
+适用场景
+--------
+主脚本 workbuddy_daily.py 已内置 WxPusher（配置环境变量即启用）。
+本脚本用于按需转发的场景：在 Actions 跑完签到后，读取运行日志重建「签到报告」，
+再单独推送到 WxPusher / Bark；适合临时补发，或已有日志想统一转发的用法。
 
 用法
 ----

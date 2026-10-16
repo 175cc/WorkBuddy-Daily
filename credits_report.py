@@ -118,8 +118,8 @@ def account_label(tok, fallback=""):
 
 
 def mask_phone(s):
-    """手机号脱敏：隐藏中间 7 位，保留前 2 后 2（如 17600015002 → 17******02）。
-    非 11 位数字原样返回（账号名/昵称等不受影响）。与上游 workbuddy_daily.py 同口径。"""
+    """手机号脱敏：隐藏中间 7 位，保留前 2 后 2（如 17********02）。
+    非 11 位数字原样返回（账号名/昵称等不受影响）。与主脚本 workbuddy_daily.py 同口径。"""
     s = str(s).strip()
     if len(s) == 11 and s.isdigit():
         return s[:2] + "*******" + s[-2:]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🌱 WorkBuddy Daily - 全能签到脚本 v3.7
+🌱 WorkBuddy Daily - 全能签到脚本 v3.8
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
