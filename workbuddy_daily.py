@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🌱 WorkBuddy Daily - 全能签到脚本 v3.11
+🌱 WorkBuddy Daily - 全能签到脚本 v3.12
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -2041,7 +2041,7 @@ def t_compensation(s, log):
     deadline = current.get("end_time", "")
     log("   🎊补偿待领取: %s积分%s" % (credit, "（截止%s）" % deadline if deadline else ""))
     try:
-        result = s.post(BASE + "/billing/meter/claim-compensation",
+        result = s.post(CBDOMAIN + "/billing/meter/claim-compensation",
                         json={}, timeout=15, verify=False).json()
     except Exception as exc:
         log("   ⚠️补偿领取请求异常: %s" % type(exc).__name__)
@@ -2061,7 +2061,7 @@ def t_compensation(s, log):
 def t_gift_compensation(s, uid, nick, log):
     """礼包(每号一次) + 活动补偿。"""
     try:
-        r = s.post(BASE + "/billing/meter/claim-gift", json={}, timeout=15, verify=False).json()
+        r = s.post(CBDOMAIN + "/billing/meter/claim-gift", json={}, timeout=15, verify=False).json()
         if r.get("code") == 0:
             log("   🎊新手礼包: +%s积分" % r.get("data", {}).get("credit", "?"))
     except Exception:
