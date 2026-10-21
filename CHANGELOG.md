@@ -9,7 +9,7 @@
 - 猫猫旅行领取改用状态回执里的 `record_id`，并以实际 `reward_credit` 确认到账。
 - 补签改用服务端日历、活动上线日和当月边界选日期，排除已补记录；默认每轮只补最近一张，补签后刷新连签再兑换。
 - 补偿和新手礼包增加先查后领、真实 `credit` 判定及本地期次防重，不再把可领额度冒充本次到账。
-- 企业切换会话（JWT `token_source=enterprise_switch`）跳过行为任务，仅保留只读查询与已有奖励补领。
+- 企业形态仍以账号 `enterpriseId` 为准；后续真机 A/B 已证伪 `token_source=enterprise_switch` 代表企业上下文，因此不按该 JWT 声明跳过行为任务。
 - 新增 Server酱微信推送（`SERVERCHAN_SENDKEY`，含 `sctp` 方糖专属通道），由社区 PR #32 贡献。
 - 新增 6 项离线回归测试，覆盖进度补领、签到判定、旅行 `record_id`、补签候选、补偿本地防重和 Server酱地址解析。
 

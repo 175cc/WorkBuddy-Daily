@@ -439,7 +439,7 @@ python daily_forward.py daily.log --wx
 >
 > 🎁 领奖按任务进度扫描，`progress.current >= progress.target` 即补领，不依赖可能延迟或回滚的 `accept_status`。
 >
-> ✅ 签到网络失败、空回执或业务错误不再打印成“签到成功”；企业切换会话（JWT `token_source=enterprise_switch`）会跳过行为任务，只保留只读查询与已有奖励补领。
+> ✅ 签到网络失败、空回执或业务错误不再打印成“签到成功”。企业形态仍按账号 `enterpriseId` 判定；`token_source` 只表示授权流程，不作为跳过任务的依据。
 
 ---
 

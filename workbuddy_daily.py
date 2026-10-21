@@ -143,7 +143,7 @@
    · 旅行领奖：claim 携带服务端 record_id，只有回执含 reward_credit 才确认到账
    · 补签日历：按服务端 today/launch_date/当月边界选断点，排除 makeup_dates，默认只补最近一张
    · 礼包补偿：先查 active/claimed/credit_num，再按回执 credit 判定本次到账；本地按活动期防重
-   · 企业切换会话：JWT token_source=enterprise_switch 时跳过行为任务，仅保留查询与补领
+   · 企业形态以账号 enterpriseId 为准；token_source 只表示授权流程，不作为跳过任务依据
    · 凭据失效隔离：AT/RT 过期或格式错只跳过该账号并给出排障提示，不再整轮崩溃
    · 子任务开关：WORKBUDDY_TASKS（白名单）/ WORKBUDDY_SKIP_TASKS（黑名单）——
      可只留签到+旅行，其余任务以后想做时再放开（积分一个月有效期，不需一次领完）
@@ -3620,9 +3620,6 @@ def run_account(idx, acc, do_desktop):
                       "rest": ["凭据缺失"], "level": "?", "energy": "?"}
     uid = uid_of(tok)
     nick = nickname_of(tok)
-    enterprise_switch = (
-        str(_jwt_claims(tok).get("token_source") or "").strip().lower()
-        == "enterprise_switch")
     s = new_api(tok)
 
     log("")
@@ -3668,20 +3665,6 @@ def run_account(idx, acc, do_desktop):
         % (prof.get("level", "?"), summary["checkin_streak"], streak.get("days", "?"), energy, signed))
     if QUERY_ONLY:
         return msgs, {"idx": idx, "note": acc.get("note", ""), "done": 0, "total": 0, "rest": [], "level": "?", "energy": "?"}
-    if enterprise_switch:
-        log("  🏢 企业切换会话：无个人成长体系，跳过行为任务，仅补领已有奖励")
-        log("  🎁 ── 领奖 ──")
-        claim_ready_tasks(s, log)
-        st_all = (_json_or_empty(s.get(
-            BASE + "/v2/activity/growth/tasks", timeout=25,
-            verify=False)).get("data") or {}).get("tasks", [])
-        done = sum(1 for t in st_all if isinstance(t, dict)
-                   and t.get("accept_status") in ("claimed", "completed"))
-        rest = [task_cn(t.get("task_code", "")) for t in st_all
-                if isinstance(t, dict)
-                and t.get("accept_status") not in ("claimed", "completed")]
-        summary.update({"done": done, "total": len(st_all), "rest": rest})
-        return msgs, summary
     # 桌面任务先做（新账号必须先有真实桌面会话，否则接受会被回滚、遥测不计数）
     need_rich = prog(s, "RichMeow_Chat")[0] not in ("completed", "claimed")
     need_skill = prog(s, "skill_1")[0] not in ("completed", "claimed")
