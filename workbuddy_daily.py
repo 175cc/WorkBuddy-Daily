@@ -869,8 +869,9 @@ def _claim_response_ok(response, payload):
     data = data if isinstance(data, dict) else {}
     message = str(payload.get("msg") or "").lower() if isinstance(payload, dict) else ""
     success = 200 <= response.status_code < 300 and _api_code_ok(code)
-    already = bool(data.get("already_claimed")) or any(
-        marker in message for marker in ("already", "已领取", "已领过"))
+    already = (200 <= response.status_code < 300 and (
+        bool(data.get("already_claimed"))
+        or any(marker in message for marker in ("already", "已领取", "已领过"))))
     return success or already, data, message
 
 
@@ -1282,6 +1283,7 @@ def t_sign(s, uid, nick, log):
     claim_code = claim_payload.get("code")
     claim_data = claim_payload.get("data") or {}
     message = str(claim_payload.get("msg") or "").strip()
+    message_lower = message.lower()
     if _api_code_ok(claim_code) and claim_data.get("credit") is not None:
         fresh = _checkin_status(s)
         pending = fresh and fresh.get("today_checked_in") not in (True, 1)
@@ -1291,12 +1293,12 @@ def t_sign(s, uid, nick, log):
         t_daily_activity(s, uid, nick, log)
         return
     if _api_code_ok(claim_code) and any(
-            marker in message for marker in ("已签到", "已领取", "already")):
+            marker in message_lower for marker in ("已签到", "已领取", "already")):
         log("   ✅签到: %s%s" % (message, _checkin_tail(s)))
         t_daily_activity(s, uid, nick, log)
         return
     if claim_code in (10001, "10001") and any(
-            marker in message for marker in ("已签到", "已领取", "already")):
+            marker in message_lower for marker in ("已签到", "已领取", "already")):
         log("   ✅签到: %s%s" % (message, _checkin_tail(s)))
         t_daily_activity(s, uid, nick, log)
         return
@@ -1768,13 +1770,13 @@ def t_travel(s, uid, nick, log):
     """派猫猫旅行：到达领礼物 / 旅行中等待 / 空闲出发（幂等状态机）"""
     try:
         vis = s.get(BASE + "/v2/activity/growth/buddy/visible", timeout=20, verify=False).json()
-        if vis.get("code") == 0:
+        if _api_code_ok(vis.get("code")):
             vd = vis.get("data", {})
             if not vd.get("buddy_visible", True) or not vd.get("has_buddy", True):
                 log("   🐾旅行: 无Buddy，跳过")
                 return
         st = s.get(BASE + "/v2/activity/growth/buddy/travel/status", timeout=20, verify=False).json()
-        if not (st.get("code") == 0):
+        if not _api_code_ok(st.get("code")):
             log("   🐾旅行: 状态获取失败")
             return
         sd = st.get("data", {})
@@ -1791,9 +1793,9 @@ def t_travel(s, uid, nick, log):
                 rr = claim_response.json() or {}
             except Exception:
                 rr = {}
-            reward = (rr.get("data") or {}).get("reward_credit")
+            reward = _dig(rr, "reward_credit")
             if (200 <= claim_response.status_code < 300
-                    and rr.get("code") in (0, 200)
+                    and _api_code_ok(rr.get("code"))
                     and reward is not None):
                 log("   🐾旅行: 🎉领取礼物 +%s积分" % reward)
             else:
@@ -2535,7 +2537,7 @@ def t_makeup(s, uid, nick, log):
             except Exception:
                 payload = {}
             if (200 <= response.status_code < 300
-                    and payload.get("code") in (0, 200)):
+                    and _api_code_ok(payload.get("code"))):
                 repaired.append(target_date)
             else:
                 log("   🩹补签%s失败: %s" % (

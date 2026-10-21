@@ -162,7 +162,8 @@ class CoreBehaviorTests(unittest.TestCase):
             }),
         ]
         session = FakeSession(response_queue)
-        module = load_functions("t_travel", BASE="https://example.test")
+        module = load_functions(
+            "_api_code_ok", "_dig", "t_travel", BASE="https://example.test")
         logs = []
         module["t_travel"](session, "u1", "nick", logs.append)
         claim_call = [call for call in session.calls
