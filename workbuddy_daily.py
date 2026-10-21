@@ -15,7 +15,7 @@
    📱 小程序任务     Tasks_1~7 链式任务（每日零点解锁一环，日志给出解锁日期）
    🎮 8 项互动玩法   抽奖、盲盒、Buddy、派猫猫旅行、连签兑换、补签卡、礼包补偿、徽章
    💰 三类查询       积分套餐（剩余/总量/已用）、用量统计、成长数据（等级/连签/能量）
-   🎁 自动领奖       扫描全部已完成任务自动领取；completed 未领的自动补领
+   🎁 自动领奖       按进度扫描全部已达标任务；桌面/小程序分别补领
    📢 多渠道推送     PushPlus / Bark / WxPusher / Server酱 / 企业微信 / 钉钉 / 青龙默认通知，配了哪个推哪个
                      青龙环境会自动读面板 token，直接用面板里配好的通知渠道
    🧩 幂等安全       重复运行只补缺口，不会重复领取或重复操作
@@ -71,6 +71,9 @@
    QL_URL / QL_DIR / QL_TOKEN
                              【可选】面板地址 / 数据目录 / 旧版面板 token（默认自动探测）
    WORKBUDDY_MP_GAP          【可选】mp 对话事件间隔秒数（默认 45，可调小提速）
+   WORKBUDDY_MAKEUP_MAX_PER_RUN
+                             【可选】每轮最多补签几张（默认 1，最多 10）
+   WORKBUDDY_BENEFIT_STATE   【可选】补偿/礼包本地期次防重文件路径
 
 获取变量值（首次必看）
    ⚠️ WorkBuddy 5.6.2+ 客户端默认开启 AtRestEncryption：认证文件里的 accessToken/refreshToken
@@ -123,6 +126,8 @@
    · 桌面任务：Windows 走真实桌面换血；非 Windows 自动降级为指纹上报（无需真实桌面端）
    · 夜猫子：官方规则为「每日 1 次 × 累计 3 天」，有响应即停，不空跑
    · accept 校验：解析接口逐任务状态 + 回读验证，未落账的自动逐个重试
+   · 进度补领：桌面与小程序任务都按 progress 达标补领，不依赖会延迟/回滚的 accept_status
+   · 签到判定：先查 activity-status，仅在活动期且今日未签时领取；空回执不再写成成功
    · 前置依赖：accept 报 prerequisite not met 时先补跑前置任务（如先领养首只 Buddy）再重试
    · 真实会话 id：专家/技能任务的 requestId/messageId 取自真实对话的服务端消息 id（cmb- 形态）
    · 真实场景表：模板任务取服务端 /console/as/support/scenes 的 id（拉不到回落内置表）
@@ -135,6 +140,10 @@
    · 画布与灵感：真实对话 + 桌面链（wbx_design_canvas_* / playbook_cta_click），失败回落 web 裸事件
    · 主题目录：和平精英主题取 /v2/operation-platform/appearance/resources 真 resource_key + meta
    · 备用口径：抽奖的 chances 支持 lottery/summary、兑换状态支持 redeem/summary 补位
+   · 旅行领奖：claim 携带服务端 record_id，只有回执含 reward_credit 才确认到账
+   · 补签日历：按服务端 today/launch_date/当月边界选断点，排除 makeup_dates，默认只补最近一张
+   · 礼包补偿：先查 active/claimed/credit_num，再按回执 credit 判定本次到账；本地按活动期防重
+   · 企业切换会话：JWT token_source=enterprise_switch 时跳过行为任务，仅保留查询与补领
    · 凭据失效隔离：AT/RT 过期或格式错只跳过该账号并给出排障提示，不再整轮崩溃
    · 子任务开关：WORKBUDDY_TASKS（白名单）/ WORKBUDDY_SKIP_TASKS（黑名单）——
      可只留签到+旅行，其余任务以后想做时再放开（积分一个月有效期，不需一次领完）
@@ -153,7 +162,7 @@
      青龙通知同时兼容新版「应用授权」（QL_CLIENT_ID/QL_CLIENT_SECRET→/open/system/notify）
      与旧版 auth.json（含 2.18+ 的 data/config 数据目录）两种形态
    · 完全免费：无广告、无功能限制；如帮到你，欢迎在仓库 README「☕ 支持与投喂」请我喝杯咖啡
-   · 数据文件：wb_refresh_tokens.json 自动生成与维护，无需手动管理
+   · 数据文件：wb_refresh_tokens.json / 活跃与福利状态文件自动生成，无需手动管理
    · 新增账号：变量值末尾追加一行 "手机号:AT:RT" 即可，下次运行自动并入
 
 📄 依赖：requests（pip3 install requests）
@@ -235,6 +244,11 @@ def _as_int(value, default=0):
         return int(float(value))
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _api_code_ok(code):
+    """常见成功业务码：0 / 200，兼容字符串形态。"""
+    return code in (0, 200, "0", "200")
 
 
 def _dig(obj, key):
@@ -854,7 +868,7 @@ def _claim_response_ok(response, payload):
     data = payload.get("data") if isinstance(payload, dict) else None
     data = data if isinstance(data, dict) else {}
     message = str(payload.get("msg") or "").lower() if isinstance(payload, dict) else ""
-    success = 200 <= response.status_code < 300 and code in (0, 200, None)
+    success = 200 <= response.status_code < 300 and _api_code_ok(code)
     already = bool(data.get("already_claimed")) or any(
         marker in message for marker in ("already", "已领取", "已领过"))
     return success or already, data, message
@@ -1236,7 +1250,7 @@ def t_sign(s, uid, nick, log):
         log("   ❌签到状态查询失败: HTTP %s" % status_response.status_code)
         return
     status_code = status_payload.get("code")
-    if status_code not in (0, 200, None):
+    if status_code is not None and not _api_code_ok(status_code):
         log("   ❌签到状态查询失败: %s" % str(
             status_payload.get("msg") or "code %s" % status_code)[:60])
         return
@@ -1268,7 +1282,7 @@ def t_sign(s, uid, nick, log):
     claim_code = claim_payload.get("code")
     claim_data = claim_payload.get("data") or {}
     message = str(claim_payload.get("msg") or "").strip()
-    if claim_code in (0, 200, None) and claim_data.get("credit") is not None:
+    if _api_code_ok(claim_code) and claim_data.get("credit") is not None:
         fresh = _checkin_status(s)
         pending = fresh and fresh.get("today_checked_in") not in (True, 1)
         log("   ✅签到成功 +%s积分%s%s" % (
@@ -1276,7 +1290,7 @@ def t_sign(s, uid, nick, log):
             "（状态稍后刷新）" if pending else ""))
         t_daily_activity(s, uid, nick, log)
         return
-    if claim_code in (0, 200) and any(
+    if _api_code_ok(claim_code) and any(
             marker in message for marker in ("已签到", "已领取", "already")):
         log("   ✅签到: %s%s" % (message, _checkin_tail(s)))
         t_daily_activity(s, uid, nick, log)
@@ -2262,7 +2276,8 @@ def _benefit_state_save(state):
 
 
 def _benefit_guard_key(kind, uid, end_time):
-    return "%s|%s|%s" % (kind, uid, end_time or "unknown")
+    raw = "%s|%s|%s" % (kind, uid, end_time or "unknown")
+    return "v1|" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _benefit_guard_get(kind, uid, end_time):
@@ -2350,7 +2365,7 @@ def t_compensation(s, uid, log):
 
     business_code = result.get("code")
     actual_credit = _benefit_actual_credit(result)
-    if (200 <= status_code < 300 and business_code in (0, 200, None)):
+    if 200 <= status_code < 300 and _api_code_ok(business_code):
         try:
             _benefit_guard_mark(
                 "compensation", uid, deadline, "processed", actual_credit)
@@ -2403,7 +2418,7 @@ def _claim_gift(s, uid, log):
         return
     business_code = result.get("code")
     actual_credit = _benefit_actual_credit(result)
-    if (200 <= status_code < 300 and business_code in (0, 200, None)):
+    if 200 <= status_code < 300 and _api_code_ok(business_code):
         try:
             _benefit_guard_mark("gift", uid, deadline, "processed", actual_credit)
         except Exception as exc:
