@@ -16,7 +16,7 @@
    🎮 8 项互动玩法   抽奖、盲盒、Buddy、派猫猫旅行、连签兑换、补签卡、礼包补偿、徽章
    💰 三类查询       积分套餐（剩余/总量/已用）、用量统计、成长数据（等级/连签/能量）
    🎁 自动领奖       扫描全部已完成任务自动领取；completed 未领的自动补领
-   📢 多渠道推送     PushPlus / Bark / 企业微信 / 钉钉 / 青龙默认通知，配了哪个推哪个
+   📢 多渠道推送     PushPlus / Bark / WxPusher / Server酱 / 企业微信 / 钉钉 / 青龙默认通知，配了哪个推哪个
                      青龙环境会自动读面板 token，直接用面板里配好的通知渠道
    🧩 幂等安全       重复运行只补缺口，不会重复领取或重复操作
    🔄 API 重试       网络/5xx 自动指数退避重试，写动作间隔可调（--gap）
@@ -61,6 +61,8 @@
                              创建应用后获得，扫码关注该应用即可用微信收推送
    WXPUSHER_UID              【可选】WxPusher 用户 UID（UID_ 开头，扫码关注后在「我的」页查看；
                              多个用逗号/分号分隔，如 UID_aaa,UID_bbb）
+   SERVERCHAN_SENDKEY        【可选】Server酱 微信推送（免费每天 5 条）：https://sct.ftqq.com
+                             sctp 开头的是「方糖」专属通道，脚本会自动走对应域名
    WECOM_WEBHOOK             【可选】企业微信群机器人（完整 URL 或仅 key）
    DINGTALK_WEBHOOK          【可选】钉钉群机器人 webhook（安全设置：自定义关键词或加签）
    DINGTALK_SECRET           【可选】钉钉加签密钥（机器人选「加签」时必填）
@@ -146,7 +148,8 @@
    · 凭据体检：续期前本地看 RT/AT 结构与签发域（typ=Offline / codebuddy.cn realm），
      把 12153 token format error 提前翻译成“粘反了 / 粘错了文件 / 截断了”
    · 微信关注任务：需真人扫码关注满 24 小时，脚本识别并提示，不自动完成
-   · 推送渠道：PushPlus / Bark / 企业微信 / 钉钉 / 青龙默认通知，配了哪个推哪个（都没配只提示）
+   · 推送渠道：PushPlus / Bark / WxPusher / Server酱 / 企业微信 / 钉钉 / 青龙默认通知，配了哪个推哪个（都没配只提示）
+     Server酱兼容 sctp 方糖专属通道（自动切到 {uid}.push.ft07.com），title 含换行会自动压成单行
      青龙通知同时兼容新版「应用授权」（QL_CLIENT_ID/QL_CLIENT_SECRET→/open/system/notify）
      与旧版 auth.json（含 2.18+ 的 data/config 数据目录）两种形态
    · 完全免费：无广告、无功能限制；如帮到你，欢迎在仓库 README「☕ 支持与投喂」请我喝杯咖啡
@@ -3956,6 +3959,38 @@ def _dingtalk_notify(title, content):
     return False
 
 
+def _serverchan_notify(title, content):
+    """Server酱 推送（微信）；未配置 SERVERCHAN_SENDKEY 则跳过。
+
+    · SendKey 以 sctp 开头的是「方糖」专属通道，需走 https://{uid}.push.ft07.com/send/{key}.send
+      （uid 取 SendKey 里 sctp 与 t 之间的数字）；其余走 sctapi.ftqq.com/{key}.send
+    · title 不能含换行，先压成单行；desp 支持 Markdown，原样发
+    · 免费额度每天 5 条，脚本只在收尾汇总推一条，别挪到循环里
+    """
+    key = os.environ.get("SERVERCHAN_SENDKEY", "").strip()
+    if not key:
+        return False
+    if key.startswith("sctp"):
+        uid = re.sub(r"^sctp(\d+)t.*$", r"\1", key)
+        url = "https://%s.push.ft07.com/send/%s.send" % (uid, key)
+    else:
+        url = "https://sctapi.ftqq.com/%s.send" % key
+    title = re.sub(r"[\r\n]+", " ", title).strip()   # title 不允许换行
+    if len(content) > 30000:
+        content = content[:30000] + "\n...(内容过长已截断)"
+    try:
+        s = requests.Session(); s.trust_env = False
+        r = s.post(url, data={"title": title, "desp": content}, timeout=20, verify=False)
+        d = r.json()
+        if d.get("code") == 0:
+            print("📢 Server酱 推送成功")
+            return True
+        print("📢 Server酱 推送失败: %s" % str(d.get("message", ""))[:80])
+    except Exception as e:
+        print("📢 Server酱 异常: %s" % str(e)[:80])
+    return False
+
+
 def _ql_base():
     """青龙面板地址：QL_URL / QL_BASE_URL 显式指定，默认本机 5700。"""
     return (os.environ.get("QL_URL", "").strip() or os.environ.get("QL_BASE_URL", "").strip()
@@ -4046,19 +4081,21 @@ def _ql_notify(title, content):
 
 
 def send_notify_all(title, content):
-    """推送到所有已配置的渠道：PushPlus / Bark / WxPusher / 企业微信 / 钉钉 / 青龙默认通知。
+    """推送到所有已配置的渠道：PushPlus / Bark / WxPusher / Server酱 / 企业微信 / 钉钉 / 青龙默认通知。
 
     配了哪个推哪个，都没配就只打印一行说明（不影响签到流程）。
     """
     results = [send_notify(title, content),        # PushPlus
                _bark_notify(title, content),       # Bark (iOS)
                _wxpusher_notify(title, content),   # WxPusher (微信)
+               _serverchan_notify(title, content),  # Server酱 (微信)
                _wecom_notify(title, content),      # 企业微信
                _dingtalk_notify(title, content),   # 钉钉
                _ql_notify(title, content)]         # 青龙面板默认通知
     if not any(results):
         print("ℹ️ 未配置推送渠道（PUSHPLUS_TOKEN / BARK_URL / WXPUSHER_APP_TOKEN+WXPUSHER_UID / "
-              "WECOM_WEBHOOK / DINGTALK_WEBHOOK / 青龙应用授权 QL_CLIENT_ID+QL_CLIENT_SECRET 任选其一）")
+              "SERVERCHAN_SENDKEY / WECOM_WEBHOOK / DINGTALK_WEBHOOK / "
+              "青龙应用授权 QL_CLIENT_ID+QL_CLIENT_SECRET 任选其一）")
     return any(results)
 
 

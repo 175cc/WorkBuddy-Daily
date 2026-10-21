@@ -81,7 +81,7 @@ python workbuddy_intl_daily.py --only 1             # 只跑第一个账号
 >
 > 📌 官方规则是「**每天 1 次 × 累计 3 天**」，脚本有响应即停，不会一晚空跑多次。
 >
-> 📢 **通知**：面板里配了啥通知就用啥，连 webhook 都不用填 —— 青龙 2.18+ 配 `QL_CLIENT_ID` + `QL_CLIENT_SECRET`（面板「应用授权」，需 system 权限），旧版自动读 `auth.json`；也支持 PushPlus / Bark / WxPusher / 企业微信 / 钉钉五种 webhook 渠道。
+> 📢 **通知**：面板里配了啥通知就用啥，连 webhook 都不用填 —— 青龙 2.18+ 配 `QL_CLIENT_ID` + `QL_CLIENT_SECRET`（面板「应用授权」，需 system 权限），旧版自动读 `auth.json`；也支持 PushPlus / Bark / WxPusher / Server酱 / 企业微信 / 钉钉六种 webhook 渠道。
 
 ```bash
 # 依赖（仅一个）
@@ -105,6 +105,7 @@ pip3 install requests
 | `BARK_URL` | ⬜ | 可选，Bark 推送（iOS），如 `https://api.day.app/xxxxxxxx` |
 | `WXPUSHER_APP_TOKEN` | ⬜ | 可选，WxPusher 应用令牌（`AT_` 开头），在 wxpusher.zjiecode.com 创建应用后获得 |
 | `WXPUSHER_UID` | ⬜ | 可选，WxPusher 用户 UID（`UID_` 开头），多个用逗号/分号分隔 |
+| `SERVERCHAN_SENDKEY` | ⬜ | 可选，Server酱 微信推送（[官网](https://sct.ftqq.com) 免费获取，免费额度每天 5 条）。`sctp` 开头的是方糖专属通道，脚本会自动切到对应域名 |
 | `WECOM_WEBHOOK` | ⬜ | 可选，企业微信群机器人 webhook（或仅 key） |
 | `DINGTALK_WEBHOOK` | ⬜ | 可选，钉钉群机器人 webhook（安全设置：自定义关键词或加签） |
 | `DINGTALK_SECRET` | ⬜ | 可选，钉钉加签密钥（机器人选「加签」时必填） |
@@ -295,6 +296,7 @@ python daily_forward.py daily.log --wx
 | `BARK_URL` | ⬜ | 可选，Bark 推送（iOS），如 `https://api.day.app/xxxxxxxx`（自建服务器换域名即可） |
 | `WXPUSHER_APP_TOKEN` | ⬜ | 可选，WxPusher 应用令牌（`AT_` 开头），[官网](https://wxpusher.zjiecode.com) 创建应用后获得 |
 | `WXPUSHER_UID` | ⬜ | 可选，WxPusher 用户 UID（`UID_` 开头，扫码关注后查看），多个用逗号/分号分隔 |
+| `SERVERCHAN_SENDKEY` | ⬜ | 可选，Server酱 微信推送（[官网](https://sct.ftqq.com) 免费获取，免费额度每天 5 条）。`sctp` 开头的 SendKey 会自动走方糖专属通道 |
 | `WECOM_WEBHOOK` | ⬜ | 可选，企业微信群机器人。填完整 webhook URL，或只填 key（自动补全域名） |
 | `DINGTALK_WEBHOOK` | ⬜ | 可选，钉钉群机器人。安全设置选「自定义关键词」时，标题里带该词即可；选「加签」则再加 `DINGTALK_SECRET` |
 | `DINGTALK_SECRET` | ⬜ | 可选，钉钉加签密钥（`SEC` 开头那串） |
