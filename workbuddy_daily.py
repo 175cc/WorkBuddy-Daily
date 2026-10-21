@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🌱 WorkBuddy Daily - 全能签到脚本 v3.14
+🌱 WorkBuddy Daily - 全能签到脚本 v3.15
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -158,7 +158,7 @@
 🔒 隐私说明
    脚本不含任何账号、手机号、Token 或设备信息，所有凭据均由环境变量注入。
 """
-import sys, os, re, json, time, uuid, base64, glob, hashlib, hmac, glob as _glob, shutil, subprocess, threading, queue
+import sys, os, re, json, math, time, uuid, base64, glob, hashlib, hmac, glob as _glob, shutil, subprocess, threading, queue
 import requests
 
 
@@ -200,6 +200,7 @@ TASK_NAME_CN = {
     "template_5": "使用5个模板",
     "automation_1": "设置自动化任务",
     "workstation_expert": "工作台搭建师",
+    "WorkBuddy_Valorant": "无畏契约拼豆专家",
     "wb_wechat_oa_subscribe_task": "关注公众号",
     "Sequential_Tasks_1": "小程序对话",
     "Sequential_Tasks_2": "小程序专家对话",
@@ -211,8 +212,40 @@ TASK_NAME_CN = {
     "school_season": "校园日活动",
 }
 
+MP_TASK_CODES = {
+    "Sequential_Tasks_1", "Sequential_Tasks_2", "Sequential_Tasks_3",
+    "Sequential_Tasks_4", "Sequential_Tasks_5", "Sequential_Tasks_6",
+    "Sequential_Tasks_7", "school_season",
+}
+
 def task_cn(code):
     return TASK_NAME_CN.get(code, code)
+
+
+def _as_int(value, default=0):
+    """把接口里可能为字符串/浮点的数字安全转成 int。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        return int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _dig(obj, key):
+    """在 data/result/response 等常见信封里递归查找字段。"""
+    if isinstance(obj, dict):
+        if key in obj and obj[key] is not None:
+            return obj[key]
+        for wrapper in ("data", "result", "resp", "response"):
+            nested = obj.get(wrapper)
+            if isinstance(nested, dict):
+                found = _dig(nested, key)
+                if found is not None:
+                    return found
+    return None
 
 
 QQ_TPL = "cb_y5Dy46tPQGGWtueMxXbe"          # 企鹅教师助手模板
@@ -301,6 +334,8 @@ INFO_BACKUP = os.path.join(os.path.expanduser("~"), "AppData", "Local", "CodeBud
 REFRESH_URL = "https://copilot.tencent.com/v2/plugin/auth/token/refresh"
 REFRESH_STORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wb_refresh_tokens.json")
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "WORKBUDDY_ACCESS_TOKEN.txt")
+BENEFIT_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "workbuddy_benefit_state.json")
 
 
 
@@ -810,6 +845,18 @@ def prog(s, code):
     return None, None, None
 
 
+def _claim_response_ok(response, payload):
+    """领取回执是否确认已处理（成功、幂等已领或明确 already claimed）。"""
+    code = payload.get("code") if isinstance(payload, dict) else None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    data = data if isinstance(data, dict) else {}
+    message = str(payload.get("msg") or "").lower() if isinstance(payload, dict) else ""
+    success = 200 <= response.status_code < 300 and code in (0, 200, None)
+    already = bool(data.get("already_claimed")) or any(
+        marker in message for marker in ("already", "已领取", "已领过"))
+    return success or already, data, message
+
+
 def claim(s, code, log):
     """M15 领奖：chat 域 400 时自动降级 web 域（x-client-platform: web）。"""
     r = s.post(BASE + "/activity/growth/tasks/%s/claim" % code, json={}, timeout=20, verify=False)
@@ -820,10 +867,21 @@ def claim(s, code, log):
                    headers={"Origin": BASE, "Referer": BASE + "/profile/growth-center",
                             "x-client-platform": "web"})
     try:
-        d = r.json().get("data", {})
-        log("   🎁领奖[%s]: %s" % (code, "已领过" if d.get("already_claimed") else "+%s积分+%s能量" % (d.get("credit"), d.get("energy"))))
+        payload = r.json() or {}
     except Exception:
-        log("   领奖[%s]: HTTP %s" % (code, r.status_code))
+        payload = {}
+    ok, data, message = _claim_response_ok(r, payload)
+    if data.get("already_claimed") or any(marker in message for marker in ("already", "已领取", "已领过")):
+        log("   🎁领奖[%s]: 已领过" % code)
+    elif ok and data.get("credit") is not None:
+        log("   🎁领奖[%s]: +%s积分+%s能量" % (
+            code, data.get("credit"), data.get("energy")))
+    elif ok:
+        log("   🎁领奖[%s]: 已处理，回执未提供实际到账额" % code)
+    else:
+        log("   领奖[%s]: 失败 HTTP %s %s" % (
+            code, r.status_code, message[:60]))
+    return ok
 
 
 def report(s, uid, nick, events, base=None, headers=None):
@@ -1157,26 +1215,76 @@ def t_daily_activity(s, uid, nick, log):
 def t_sign(s, uid, nick, log):
     """每日签到 + 签到活动读数（连签天数 / 累计积分 / 连签奖励日）
 
-    daily-checkin 对瞬时错误（网络/5xx）有界重试 2 次（2s/4s）——上游 panel 口径：
-    业务错误（今天已签到/4xx）不重试，避免把幂等拒绝当成失败反复打上游。
+    先查活动状态，确认在活动期且今天未签才 POST。daily-checkin 对瞬时错误
+    （网络/5xx）有界重试，但空 200、业务失败或没有 credit 的响应不再写成成功。
     """
-    credit = None; msg = ""
     try:
-        d = api_retry(s, "POST", BASE + "/v2/billing/meter/daily-checkin", body={},
-                      retries=3, gap=2.0).json()
-        if is_enterprise_denial(None, d):
-            log("   🏢 企业版账号：上游不支持签到与个人成长任务（本次跳过）")
-            return
-        if d.get("code") in (0, 200):
-            credit = (d.get("data") or {}).get("credit")
-        msg = (d.get("msg") or "")[:40]
-    except Exception:
-        msg = "签到请求失败（网络/5xx 重试后仍失败）"
-    tail = _checkin_tail(s)
-    if credit is not None:
-        log("   ✅签到成功 +%s积分%s" % (credit, tail))
-    else:
-        log("   ✅签到: %s%s" % (msg or "今天已签到，请明天再来", tail))
+        status_response = api_retry(
+            s, "POST", BASE + "/v2/billing/meter/checkin-activity-status",
+            body={}, retries=3, gap=2.0)
+        status_payload = status_response.json() or {}
+    except Exception as exc:
+        log("   ❌签到状态查询失败（网络/5xx 重试后仍失败）: %s" % str(exc)[:60])
+        return
+    if is_enterprise_denial(status_response.status_code, status_payload):
+        log("   🏢 企业版账号：上游不支持签到与个人成长任务（本次跳过）")
+        return
+    if not (200 <= status_response.status_code < 300):
+        log("   ❌签到状态查询失败: HTTP %s" % status_response.status_code)
+        return
+    status_code = status_payload.get("code")
+    if status_code not in (0, 200, None):
+        log("   ❌签到状态查询失败: %s" % str(
+            status_payload.get("msg") or "code %s" % status_code)[:60])
+        return
+    status_data = status_payload.get("data") or {}
+    if status_data.get("active") is False:
+        name = str(status_data.get("activity_name") or "").strip()
+        log("   ℹ️签到活动未开启%s" % ("（%s）" % name if name else ""))
+        t_daily_activity(s, uid, nick, log)
+        return
+    if status_data.get("today_checked_in") in (True, 1):
+        log("   ✅签到: 今天已签到%s" % _checkin_tail(s))
+        t_daily_activity(s, uid, nick, log)
+        return
+
+    try:
+        claim_response = api_retry(
+            s, "POST", BASE + "/v2/billing/meter/daily-checkin",
+            body={}, retries=3, gap=2.0)
+        claim_payload = claim_response.json() or {}
+    except Exception as exc:
+        log("   ❌签到请求失败（网络/5xx 重试后仍失败）: %s" % str(exc)[:60])
+        return
+    if is_enterprise_denial(claim_response.status_code, claim_payload):
+        log("   🏢 企业版账号：上游不支持签到与个人成长任务（本次跳过）")
+        return
+    if not (200 <= claim_response.status_code < 300):
+        log("   ❌签到失败: HTTP %s" % claim_response.status_code)
+        return
+    claim_code = claim_payload.get("code")
+    claim_data = claim_payload.get("data") or {}
+    message = str(claim_payload.get("msg") or "").strip()
+    if claim_code in (0, 200, None) and claim_data.get("credit") is not None:
+        fresh = _checkin_status(s)
+        pending = fresh and fresh.get("today_checked_in") not in (True, 1)
+        log("   ✅签到成功 +%s积分%s%s" % (
+            claim_data.get("credit"), _checkin_tail(s),
+            "（状态稍后刷新）" if pending else ""))
+        t_daily_activity(s, uid, nick, log)
+        return
+    if claim_code in (0, 200) and any(
+            marker in message for marker in ("已签到", "已领取", "already")):
+        log("   ✅签到: %s%s" % (message, _checkin_tail(s)))
+        t_daily_activity(s, uid, nick, log)
+        return
+    if claim_code in (10001, "10001") and any(
+            marker in message for marker in ("已签到", "已领取", "already")):
+        log("   ✅签到: %s%s" % (message, _checkin_tail(s)))
+        t_daily_activity(s, uid, nick, log)
+        return
+    log("   ❌签到未确认: %s" % (
+        message or ("code %s，回执缺少 credit" % claim_code))[:80])
     t_daily_activity(s, uid, nick, log)
 
 
@@ -1655,11 +1763,25 @@ def t_travel(s, uid, nick, log):
         sd = st.get("data", {})
         state = sd.get("state", "idle")
         if state == "arrived":
-            rr = s.post(BASE + "/v2/activity/growth/buddy/travel/claim", json={}, timeout=20, verify=False).json()
-            if rr.get("code") == 0:
-                log("   🐾旅行: 🎉领取礼物 +%s积分" % rr.get("data", {}).get("reward_credit", 0))
+            record_id = sd.get("record_id")
+            if record_id in (None, "", 0):
+                log("   🐾旅行: 已到达但状态缺少 record_id，本轮不领奖也不重新派出")
+                return
+            claim_response = s.post(
+                BASE + "/v2/activity/growth/buddy/travel/claim",
+                json={"record_id": record_id}, timeout=20, verify=False)
+            try:
+                rr = claim_response.json() or {}
+            except Exception:
+                rr = {}
+            reward = (rr.get("data") or {}).get("reward_credit")
+            if (200 <= claim_response.status_code < 300
+                    and rr.get("code") in (0, 200)
+                    and reward is not None):
+                log("   🐾旅行: 🎉领取礼物 +%s积分" % reward)
             else:
-                log("   🐾旅行: 领取失败 %s" % str(rr.get("msg", ""))[:40])
+                log("   🐾旅行: 领取未确认 %s" % str(
+                    rr.get("msg") or "HTTP %s" % claim_response.status_code)[:60])
                 return
         if state == "traveling":
             remain = max(0, (sd.get("arrive_at", 0) - sd.get("server_now", 0)) // 60)
@@ -2112,83 +2234,309 @@ def _desktop_fingerprint_fallback(s, uid, nick, log, need_rich, need_skill):
 
 
 
-def t_compensation(s, log):
-    """按用量管理页面口径查询、领取并回查一次性补偿。"""
-    url = BASE + "/billing/meter/compensation-status"
+def _benefit_state_path():
+    return (os.environ.get("WORKBUDDY_BENEFIT_STATE", "").strip()
+            or BENEFIT_STATE_FILE)
 
-    def status():
-        response = s.post(url, json={}, timeout=15, verify=False).json()
-        if response.get("code") != 0 or not isinstance(response.get("data"), dict):
-            raise ValueError("补偿状态接口未返回有效数据")
-        return response["data"]
 
+def _benefit_state_load():
+    path = _benefit_state_path()
     try:
-        current = status()
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+            return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _benefit_state_save(state):
+    path = _benefit_state_path()
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(state, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(temp_path, path)
+
+
+def _benefit_guard_key(kind, uid, end_time):
+    return "%s|%s|%s" % (kind, uid, end_time or "unknown")
+
+
+def _benefit_guard_get(kind, uid, end_time):
+    return _benefit_state_load().get(_benefit_guard_key(kind, uid, end_time))
+
+
+def _benefit_guard_mark(kind, uid, end_time, status, actual_credit=None):
+    state = _benefit_state_load()
+    state[_benefit_guard_key(kind, uid, end_time)] = {
+        "status": status,
+        "actual_credit": actual_credit,
+        "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _benefit_state_save(state)
+
+
+def _benefit_status(s, path):
+    response = api_retry(
+        s, "POST", CBDOMAIN + path, body={}, retries=3, gap=1.5)
+    try:
+        payload = response.json() or {}
+    except Exception:
+        payload = {}
+    if not (200 <= response.status_code < 300):
+        raise RuntimeError("HTTP %s" % response.status_code)
+    if is_enterprise_denial(response.status_code, payload):
+        raise PermissionError("企业版账号不支持该福利")
+    if payload.get("code") not in (0, 200, None):
+        raise RuntimeError(str(payload.get("msg") or "code %s" % payload.get("code"))[:80])
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("状态回执缺少 data")
+    return data
+
+
+def _benefit_claim(s, path):
+    response = api_retry(
+        s, "POST", CBDOMAIN + path, body={}, retries=3, gap=1.5)
+    try:
+        payload = response.json() or {}
+    except Exception:
+        payload = {}
+    return response.status_code, payload
+
+
+def _benefit_actual_credit(payload):
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, dict) and "credit" in data:
+        return data.get("credit")
+    return None
+
+
+def t_compensation(s, uid, log):
+    """查询一次性补偿；同一账号同一活动期只尝试一次。"""
+    try:
+        current = _benefit_status(s, "/billing/meter/compensation-status")
+    except PermissionError:
+        log("   🏢补偿: 企业版账号不支持")
+        return
     except Exception as exc:
-        log("   ⚠️补偿状态查询失败: %s" % type(exc).__name__)
+        log("   ⚠️补偿状态查询失败: %s" % str(exc)[:80])
         return
     if not current.get("active"):
         return
     if current.get("claimed"):
         log("   🎊补偿积分: 已领取")
         return
-
-    credit = current.get("credit_num", "?")
-    deadline = current.get("end_time", "")
-    log("   🎊补偿待领取: %s积分%s" % (credit, "（截止%s）" % deadline if deadline else ""))
-    try:
-        result = s.post(CBDOMAIN + "/billing/meter/claim-compensation",
-                        json={}, timeout=15, verify=False).json()
-    except Exception as exc:
-        log("   ⚠️补偿领取请求异常: %s" % type(exc).__name__)
-        result = {}
-
-    # 请求可能成功但响应丢失；只以服务端最终状态确认到账。
-    try:
-        if status().get("claimed"):
-            log("   ✅补偿领取成功: +%s积分" % credit)
-            return
-    except Exception as exc:
-        log("   ⚠️补偿领取后状态回查失败: %s" % type(exc).__name__)
+    credit_num = _as_int(current.get("credit_num"))
+    if credit_num <= 0:
         return
-    log("   ⚠️补偿领取未确认: %s" % str(result.get("msg") or "请稍后重试")[:80])
+
+    deadline = str(current.get("end_time") or "")
+    handled = _benefit_guard_get("compensation", uid, deadline)
+    if handled:
+        log("   🎊补偿: 本期已处理，跳过重复领取（本地防重）")
+        return
+    log("   🎊补偿待领取: %s积分%s" % (
+        credit_num, "（截止%s）" % deadline if deadline else ""))
+    try:
+        status_code, result = _benefit_claim(
+            s, "/billing/meter/claim-compensation")
+    except Exception as exc:
+        log("   ⚠️补偿领取请求失败: %s（下轮重试）" % str(exc)[:80])
+        return
+
+    business_code = result.get("code")
+    actual_credit = _benefit_actual_credit(result)
+    if (200 <= status_code < 300 and business_code in (0, 200, None)):
+        try:
+            _benefit_guard_mark(
+                "compensation", uid, deadline, "processed", actual_credit)
+        except Exception as exc:
+            log("   ⚠️补偿本地防重状态保存失败: %s" % str(exc)[:60])
+        if actual_credit is not None and _as_int(actual_credit) > 0:
+            log("   ✅补偿领取成功: +%s积分" % actual_credit)
+        elif isinstance(result.get("data"), dict) and result["data"].get("already_claimed"):
+            log("   🎊补偿: 已领取")
+        else:
+            log("   ℹ️补偿本期已处理；本次回执未提供实际到账额")
+        return
+
+    message = str(result.get("msg") or "HTTP %s" % status_code)
+    if is_enterprise_denial(status_code, result):
+        log("   🏢补偿: 企业版账号不支持")
+    elif any(marker in message.lower() for marker in ("already", "已领取")):
+        try:
+            _benefit_guard_mark(
+                "compensation", uid, deadline, "already_claimed", 0)
+        except Exception:
+            pass
+        log("   🎊补偿: 已领取")
+    else:
+        log("   ⚠️补偿领取未确认: %s（下轮重试）" % message[:80])
+
+
+def _claim_gift(s, uid, log):
+    try:
+        current = _benefit_status(s, "/billing/meter/check-gift-claimed")
+    except PermissionError:
+        log("   🎁新手礼包: 企业版账号不支持")
+        return
+    except Exception as exc:
+        log("   ⚠️礼包状态查询失败: %s" % str(exc)[:80])
+        return
+    if not current.get("active") or current.get("claimed"):
+        return
+    credit_num = _as_int(current.get("credit_num"))
+    if credit_num <= 0:
+        return
+    deadline = str(current.get("end_time") or "")
+    if _benefit_guard_get("gift", uid, deadline):
+        log("   🎁新手礼包: 本期已处理，跳过重复领取（本地防重）")
+        return
+    try:
+        status_code, result = _benefit_claim(s, "/billing/meter/claim-gift")
+    except Exception as exc:
+        log("   ⚠️新手礼包领取请求失败: %s（下轮重试）" % str(exc)[:80])
+        return
+    business_code = result.get("code")
+    actual_credit = _benefit_actual_credit(result)
+    if (200 <= status_code < 300 and business_code in (0, 200, None)):
+        try:
+            _benefit_guard_mark("gift", uid, deadline, "processed", actual_credit)
+        except Exception as exc:
+            log("   ⚠️礼包本地防重状态保存失败: %s" % str(exc)[:60])
+        if actual_credit is not None and _as_int(actual_credit) > 0:
+            log("   🎊新手礼包: +%s积分" % actual_credit)
+        elif isinstance(result.get("data"), dict) and result["data"].get("already_claimed"):
+            log("   🎁新手礼包: 已领取")
+        else:
+            log("   ℹ️新手礼包本期已处理；本次回执未提供实际到账额")
+        return
+    message = str(result.get("msg") or "HTTP %s" % status_code)
+    if any(marker in message.lower() for marker in ("already", "已领取")):
+        try:
+            _benefit_guard_mark("gift", uid, deadline, "already_claimed", 0)
+        except Exception:
+            pass
+        log("   🎁新手礼包: 已领取")
+    else:
+        log("   ⚠️新手礼包领取未确认: %s（下轮重试）" % message[:80])
 
 
 def t_gift_compensation(s, uid, nick, log):
     """礼包(每号一次) + 活动补偿。"""
-    try:
-        r = s.post(CBDOMAIN + "/billing/meter/claim-gift", json={}, timeout=15, verify=False).json()
-        if r.get("code") == 0:
-            log("   🎊新手礼包: +%s积分" % r.get("data", {}).get("credit", "?"))
-    except Exception:
-        pass
-    t_compensation(s, log)
+    _claim_gift(s, uid, log)
+    t_compensation(s, uid, log)
+
+
+def _makeup_candidates(streak_body, heatmap_body):
+    """从服务端日历选出可补日期；已补过的 makeup_dates 不再提交。"""
+    import datetime
+
+    def parse_date(value):
+        if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            raise ValueError("补签日期格式无效")
+        return datetime.date.fromisoformat(value)
+
+    today_value = _dig(heatmap_body, "today")
+    if isinstance(today_value, dict):
+        today = parse_date(today_value.get("date"))
+    else:
+        today = parse_date(today_value)
+    launch_value = _dig(streak_body, "launch_date")
+    launch = parse_date(launch_value) if launch_value else datetime.date(2026, 6, 17)
+    start = max(today.replace(day=1), launch, datetime.date(2026, 6, 17))
+
+    streak = _dig(streak_body, "streak")
+    if not isinstance(streak, dict):
+        raise ValueError("连登状态缺少 streak")
+    made_up_raw = streak.get("makeup_dates", [])
+    if not isinstance(made_up_raw, list):
+        raise ValueError("makeup_dates 格式无效")
+    made_up = {parse_date(value) for value in made_up_raw}
+
+    cells = _dig(heatmap_body, "cells")
+    if not isinstance(cells, list):
+        raise ValueError("活跃日历缺少 cells")
+    scores = {}
+    for cell in cells:
+        if not isinstance(cell, dict):
+            raise ValueError("活跃日历记录格式无效")
+        day = parse_date(cell.get("date"))
+        score = cell.get("score")
+        if type(score) not in (int, float) or not math.isfinite(score) or score < 0:
+            raise ValueError("活跃日历分数无效")
+        if day in scores and scores[day] != score:
+            raise ValueError("活跃日历同一日期记录冲突")
+        scores[day] = score
+
+    return sorted(
+        (day.isoformat() for day, score in scores.items()
+         if start <= day < today and score == 0 and day not in made_up),
+        reverse=True)
 
 
 def t_makeup(s, uid, nick, log):
-    """补签卡：热力图检测昨日漏签则自动补签（保住连签）"""
-    import datetime
+    """补签卡：按服务端日历选断点，每轮默认只补最近一张。"""
     try:
-        hm = s.get(BASE + "/v2/activity/growth/heatmap", timeout=20, verify=False).json()
-        cells = hm.get("data", {}).get("cells", [])
-        bal = s.get(BASE + "/v2/activity/growth/streak", timeout=20, verify=False).json().get("data", {}).get("makeup_cards", {}).get("balance", 0)
-        yesterday = (beijing_today() - datetime.timedelta(days=1)).isoformat()
-        missed = None
-        for c in cells:
-            d = str(c.get("date", ""))[:10]
-            if d == yesterday and not c.get("score", 0):
-                missed = yesterday
-                break
-        if missed and bal > 0:
-            r = s.post(BASE + "/v2/activity/growth/makeup-cards/use", json={"target_date": missed},
-                       timeout=20, verify=False).json()
-            log("   🩹补签%s: %s" % (missed, "成功，连签保住" if r.get("code") == 0 else str(r.get("msg", ""))[:40]))
-        elif missed:
-            log("   🩹昨日(%s)漏签但无补签卡" % missed)
+        streak_response = s.get(
+            BASE + "/v2/activity/growth/streak", timeout=20, verify=False)
+        heatmap_response = s.get(
+            BASE + "/v2/activity/growth/heatmap", timeout=20, verify=False)
+        streak_body = streak_response.json() or {}
+        heatmap_body = heatmap_response.json() or {}
+        current_streak = _dig(streak_body, "streak")
+        current_days = current_streak.get("days") if isinstance(current_streak, dict) else None
+
+        cards = _dig(streak_body, "makeup_cards")
+        if isinstance(cards, dict):
+            balance = _as_int(cards.get("balance"))
+        elif isinstance(cards, (int, float, str)):
+            balance = _as_int(cards)
         else:
+            balance = _as_int(_dig(streak_body, "makeup_card_count"))
+
+        candidates = _makeup_candidates(streak_body, heatmap_body)
+        if not candidates:
             log("   🩹无漏签，无需补签")
-    except Exception as e:
-        log("   🩹补签检查异常: %s" % str(e)[:50])
+            return current_days
+        if balance <= 0:
+            log("   🩹发现%s个可补日期，但无补签卡" % len(candidates))
+            return current_days
+
+        max_per_run = min(10, max(1, _as_int(
+            os.environ.get("WORKBUDDY_MAKEUP_MAX_PER_RUN", "1"), 1)))
+        use_count = min(balance, max_per_run, len(candidates))
+        repaired = []
+        for target_date in candidates[:use_count]:
+            response = s.post(
+                BASE + "/v2/activity/growth/makeup-cards/use",
+                json={"target_date": target_date}, timeout=20, verify=False)
+            try:
+                payload = response.json() or {}
+            except Exception:
+                payload = {}
+            if (200 <= response.status_code < 300
+                    and payload.get("code") in (0, 200)):
+                repaired.append(target_date)
+            else:
+                log("   🩹补签%s失败: %s" % (
+                    target_date, str(payload.get("msg") or "HTTP %s"
+                                      % response.status_code)[:60]))
+                break
+
+        if repaired:
+            fresh = s.get(
+                BASE + "/v2/activity/growth/streak", timeout=20, verify=False).json() or {}
+            fresh_streak = _dig(fresh, "streak")
+            current_days = (fresh_streak.get("days")
+                            if isinstance(fresh_streak, dict) else current_days)
+            log("   🩹补签成功: %s（活跃连签%s天）" % (
+                "、".join(repaired), current_days if current_days is not None else "待刷新"))
+        return current_days
+    except Exception as exc:
+        log("   🩹补签检查异常: %s" % str(exc)[:60])
+        return None
 
 
 def has_buddy(s):
@@ -2694,10 +3042,20 @@ def _mp_claim(s, code, log):
     try:
         r = s.post(BASE + "/activity/growth/tasks/%s/claim" % code, json={},
                    timeout=20, verify=False, headers=MP_HEADER)
-        d = r.json().get("data", {})
-        log("   🎁领奖[%s]: %s" % (code, "已领过" if d.get("already_claimed")
-                                   else "+%s积分+%s能量" % (d.get("credit"), d.get("energy"))))
-        return r.status_code == 200
+        payload = r.json() or {}
+        ok, data, message = _claim_response_ok(r, payload)
+        if data.get("already_claimed") or any(
+                marker in message for marker in ("already", "已领取", "已领过")):
+            log("   🎁领奖[%s]: 已领过" % code)
+        elif ok and data.get("credit") is not None:
+            log("   🎁领奖[%s]: +%s积分+%s能量" % (
+                code, data.get("credit"), data.get("energy")))
+        elif ok:
+            log("   🎁领奖[%s]: 已处理，回执未提供实际到账额" % code)
+        else:
+            log("   🎁领奖[%s]: 失败 HTTP %s %s" % (
+                code, r.status_code, message[:60]))
+        return ok
     except Exception as e:
         log("   🎁领奖[%s]: 失败 %s" % (code, str(e)[:50]))
         return False
@@ -2896,7 +3254,7 @@ def t_unknown_tasks(s, uid, nick, log):
     known = {"create_canvas", "playbook_prompt", "RichMeow_Chat", "Library_read", "Expert_lighthouse",
              "Expert_Philanthropy", "Hp_Appearance", "Buddy_App", "Buddy_App_QQ", "Model_chat_GLM5.2",
              "black_cat", "Expert_team_use_3", "first_buddy", "chat_5", "skill_1", "expert_5",
-             "template_5", "automation_1", "workstation_expert",
+             "template_5", "automation_1", "workstation_expert", "WorkBuddy_Valorant",
              "Sequential_Tasks_1", "Sequential_Tasks_2", "Sequential_Tasks_3",
              "Sequential_Tasks_4", "Sequential_Tasks_5",
              "Sequential_Tasks_6", "Sequential_Tasks_7"}
@@ -2939,6 +3297,72 @@ def t_unknown_tasks(s, uid, nick, log):
         log("   ⏰ 任务有效期提醒（未完成）:")
         for code, ve, when in soon[:6]:
             log("      · %s %s（%s）" % (code, ve, when))
+
+
+def claim_ready_tasks(s, log):
+    """领取所有进度已达标但尚未入账的任务。
+
+    以 progress.current >= progress.target 为准，不依赖可能延迟或回滚的
+    accept_status。桌面与小程序任务分开扫描，按 task_code 去重；同一任务
+    两边都可领时优先小程序口径。
+    """
+    merged = {}
+
+    def claimable(task):
+        if task.get("locked"):
+            return False
+        status = str(task.get("accept_status") or "")
+        claimed_value = task.get("claimed")
+        if claimed_value is True or str(claimed_value).lower() == "true":
+            return False
+        if status == "claimed":
+            return False
+        progress = task.get("progress") or {}
+        current = _as_int(progress.get("current"))
+        target = _as_int(progress.get("target"))
+        if target > 0 and current >= target:
+            return True
+        return target <= 0 and status == "completed"
+
+    def collect(headers=None, mp=False):
+        try:
+            response = s.get(BASE + "/v2/activity/growth/tasks", timeout=25,
+                             verify=False, headers=headers)
+            payload = response.json() or {}
+            rows = (payload.get("data") or {}).get("tasks", [])
+        except Exception as exc:
+            log("   ⚠️领奖扫描失败(%s): %s" % ("小程序" if mp else "桌面", str(exc)[:50]))
+            return
+        for task in rows:
+            if not isinstance(task, dict):
+                continue
+            code = str(task.get("task_code") or "").strip()
+            if not code:
+                continue
+            can_claim = claimable(task)
+            old = merged.get(code)
+            if old is None:
+                merged[code] = {"task": task, "mp": mp, "claimable": can_claim}
+            elif can_claim and not old["claimable"]:
+                merged[code] = {"task": task, "mp": mp, "claimable": True}
+            elif can_claim and old["claimable"] and mp and not old["mp"]:
+                merged[code] = {"task": task, "mp": True, "claimable": True}
+
+    collect()
+    collect(MP_HEADER, mp=True)
+    claimed = 0
+    for code, item in merged.items():
+        if not item["claimable"]:
+            continue
+        use_mp = bool(item["mp"] or code in MP_TASK_CODES)
+        ok = _mp_claim(s, code, log) if use_mp else claim(s, code, log)
+        if ok:
+            claimed += 1
+        time.sleep(1)
+    if claimed == 0:
+        log("   无达标未领奖励")
+    else:
+        log("   🎁 达标补领完成: %d 项" % claimed)
 
 
 # ---------- 稳定指纹 & 事件构建（从 task_runner.py 移植） ----------
@@ -3176,6 +3600,9 @@ def run_account(idx, acc, do_desktop):
                       "rest": ["凭据缺失"], "level": "?", "energy": "?"}
     uid = uid_of(tok)
     nick = nickname_of(tok)
+    enterprise_switch = (
+        str(_jwt_claims(tok).get("token_source") or "").strip().lower()
+        == "enterprise_switch")
     s = new_api(tok)
 
     log("")
@@ -3221,6 +3648,20 @@ def run_account(idx, acc, do_desktop):
         % (prof.get("level", "?"), summary["checkin_streak"], streak.get("days", "?"), energy, signed))
     if QUERY_ONLY:
         return msgs, {"idx": idx, "note": acc.get("note", ""), "done": 0, "total": 0, "rest": [], "level": "?", "energy": "?"}
+    if enterprise_switch:
+        log("  🏢 企业切换会话：无个人成长体系，跳过行为任务，仅补领已有奖励")
+        log("  🎁 ── 领奖 ──")
+        claim_ready_tasks(s, log)
+        st_all = (_json_or_empty(s.get(
+            BASE + "/v2/activity/growth/tasks", timeout=25,
+            verify=False)).get("data") or {}).get("tasks", [])
+        done = sum(1 for t in st_all if isinstance(t, dict)
+                   and t.get("accept_status") in ("claimed", "completed"))
+        rest = [task_cn(t.get("task_code", "")) for t in st_all
+                if isinstance(t, dict)
+                and t.get("accept_status") not in ("claimed", "completed")]
+        summary.update({"done": done, "total": len(st_all), "rest": rest})
+        return msgs, summary
     # 桌面任务先做（新账号必须先有真实桌面会话，否则接受会被回滚、遥测不计数）
     need_rich = prog(s, "RichMeow_Chat")[0] not in ("completed", "claimed")
     need_skill = prog(s, "skill_1")[0] not in ("completed", "claimed")
@@ -3258,11 +3699,12 @@ def run_account(idx, acc, do_desktop):
         """子任务调度：按 TASK_ONLY / TASK_SKIP 决定是否执行，单项异常不拖垮整轮。"""
         if not want(*codes):
             log("   ⏭️ %s: 按配置跳过" % label)
-            return
+            return None
         try:
-            fn()
+            return fn()
         except Exception as e:
             log("   ⚠️ %s 异常: %s" % (label, str(e)[:80]))
+            return None
 
     # 前置：无 Buddy 实例时，其余任务 accept 会被服务端拒绝（prerequisite not met: first_buddy）
     t_first_buddy(s, uid, nick, log)
@@ -3291,23 +3733,19 @@ def run_account(idx, acc, do_desktop):
     _run("盲盒", ["blindbox"], lambda: t_blindbox(s, uid, nick, log))
     _run("Buddy 信息", ["buddy_info"], lambda: t_buddy_info(s, uid, nick, log))
     _run("派猫猫旅行", ["travel"], lambda: t_travel(s, uid, nick, log))
-    _run("补签", ["makeup"], lambda: t_makeup(s, uid, nick, log))
-    _run("连登兑换", ["redeem"], lambda: t_redeem(s, uid, nick, log, streak.get("days")))
+    streak_days_for_redeem = streak.get("days")
+    makeup_days = _run("补签", ["makeup"], lambda: t_makeup(s, uid, nick, log))
+    if makeup_days is not None:
+        streak_days_for_redeem = makeup_days
+    _run("连登兑换", ["redeem"],
+         lambda: t_redeem(s, uid, nick, log, streak_days_for_redeem))
     _run("抽奖", ["lottery"], lambda: t_lottery(s, uid, nick, log))
     _run("礼包/补偿", ["gift"], lambda: t_gift_compensation(s, uid, nick, log))
     _run("工作台搭建师", ["workstation_expert"], lambda: t_workstation(s, uid, nick, log, tok))
     t_unknown_tasks(s, uid, nick, log)   # 未覆盖任务检测不受过滤影响
-    # 领奖
+    # 领奖：按进度补领，不依赖 accept_status 的瞬时状态
     log("  🎁 ── 领奖 ──")
-    r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False).json()
-    n = 0
-    for t in r.get("data", {}).get("tasks", []):
-        if isinstance(t, dict) and t.get("accept_status") == "completed":
-            claim(s, t.get("task_code", ""), log)
-            n += 1
-            time.sleep(1)
-    if n == 0:
-        log("   无待领奖励")
+    claim_ready_tasks(s, log)
     # 终态
     st_all = (_json_or_empty(s.get(BASE + "/v2/activity/growth/tasks", timeout=25,
                                       verify=False)).get("data") or {}).get("tasks", [])

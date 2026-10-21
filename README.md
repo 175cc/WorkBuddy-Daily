@@ -426,6 +426,8 @@ python daily_forward.py daily.log --wx
 > 活跃连登与热力图；上报失败不影响签到结果。
 >
 > 🎯 新增 `WorkBuddy_Valorant`：自动完成“无畏契约拼豆专家”召唤、真实对话和使用事件。
+>
+> 🎁 领奖按任务进度扫描，`progress.current >= progress.target` 即补领，不依赖可能延迟或回滚的 `accept_status`。
 
 ---
 
