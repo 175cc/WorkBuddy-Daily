@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🌱 WorkBuddy Daily - 全能签到脚本 v3.15
+🌱 WorkBuddy Daily - 全能签到脚本 v3.16
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -74,6 +74,8 @@
    WORKBUDDY_MAKEUP_MAX_PER_RUN
                              【可选】每轮最多补签几张（默认 1，最多 10）
    WORKBUDDY_BENEFIT_STATE   【可选】补偿/礼包本地期次防重文件路径
+   WORKBUDDY_ACTIVITY_CHAT_FALLBACK
+                             【可选】热力图未计分时是否补一次真实对话（默认 1）
 
 获取变量值（首次必看）
    ⚠️ WorkBuddy 5.6.2+ 客户端默认开启 AtRestEncryption：认证文件里的 accessToken/refreshToken
@@ -144,15 +146,17 @@
    · 补签日历：按服务端 today/launch_date/当月边界选断点，排除 makeup_dates，默认只补最近一张
    · 礼包补偿：先查 active/claimed/credit_num，再按回执 credit 判定本次到账；本地按活动期防重
    · 企业形态以账号 enterpriseId 为准；token_source 只表示授权流程，不作为跳过任务依据
+   · 会话 ID：conversationId 用 UUID v4，request/message ID 用 32 hex 毫秒前缀；不再上报项目缩写前缀
+   · 官方指纹：CN 桌面 UA/版本/commit/releaseDate/cpu/内存对齐 5.8.3，并补 qimei36
    · 凭据失效隔离：AT/RT 过期或格式错只跳过该账号并给出排障提示，不再整轮崩溃
    · 子任务开关：WORKBUDDY_TASKS（白名单）/ WORKBUDDY_SKIP_TASKS（黑名单）——
      可只留签到+旅行，其余任务以后想做时再放开（积分一个月有效期，不需一次领完）
    · mp 真人节奏：Sequential 对话判据逐条 45s±10s 上报（上游有反作弊：连发会先计数、
      后被整体回滚，claim 报 400）；--mp-gap / WORKBUDDY_MP_GAP 可调
    · accept 后回读：mp 任务接受后重读真实 target，避免“少报→误判达标→claim 400”
-   · mp 指纹：按官方源码口径（ideVersion/extVersion=2.2.8、android 14/arm64、source=mini_program）
+   · mp 指纹：公共 base 用 2.4.0；专家/灵感事件按官方发射点保留 2.2.8
    · locked 任务：任务行 locked=true（未到上线时间）直接跳过并给出解锁日，不空跑不误判
-   · mp 对话 id：conversationId / requestId / traceId 同值传递（源码同值）
+   · mp 对话 id：conversationId=UUID v4；requestId/traceId/rootRequestId=32 hex 毫秒前缀
    · 瞬时错误重试：每日签到/余额/用量对网络与 5xx 做 2s/4s 有界重试，业务错误不重试
    · 凭据体检：续期前本地看 RT/AT 结构与签发域（typ=Offline / codebuddy.cn realm），
      把 12153 token format error 提前翻译成“粘反了 / 粘错了文件 / 截断了”
@@ -189,7 +193,11 @@ except Exception:
 
 BASE = "https://www.workbuddy.cn"
 CBDOMAIN = "https://www.codebuddy.cn"   # codebuddy 域（小程序埋点 / 技能市场 / 桌面任务）
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) WorkBuddy/5.5.4 Chrome/138.0.7204.251 Electron/37.10.3 Safari/537.36"
+WORKBUDDY_UA_CN = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+DESKTOP_VERSION_CN = "5.8.3"
+DESKTOP_COMMIT_CN = "db0e9b51b7fa0b383f41f5b0b83dd442c8557918"
+DESKTOP_RELEASE_CN = 1792029498676
+UA = WORKBUDDY_UA_CN
 
 # ---------- 任务代码 → 中文名映射 ----------
 TASK_NAME_CN = {
@@ -246,6 +254,16 @@ def _as_int(value, default=0):
         return default
 
 
+def _new_conversation_id():
+    """官方会话级 ID：UUID v4（36 字符，带横线）。"""
+    return str(uuid.uuid4())
+
+
+def _new_message_id():
+    """官方消息/请求级 ID：32 hex，前 48 bit 为毫秒时间戳。"""
+    return "%012x%s" % (int(time.time() * 1000), uuid.uuid4().hex[:20])
+
+
 def _api_code_ok(code):
     """常见成功业务码：0 / 200，兼容字符串形态。"""
     return code in (0, 200, "0", "200")
@@ -263,6 +281,13 @@ def _dig(obj, key):
                 if found is not None:
                     return found
     return None
+
+
+def _env_enabled(name, default=True):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
 QQ_TPL = "cb_y5Dy46tPQGGWtueMxXbe"          # 企鹅教师助手模板
@@ -904,20 +929,21 @@ def claim(s, code, log):
 
 def report(s, uid, nick, events, base=None, headers=None):
     """events: list of dict；自动补全信封"""
-    UA_SHORT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 WorkBuddy/5.5.4"
     mid = derive_id(uid, "machine")   # 稳定指纹：同账号每次相同
     out = []
     for e in events:
         env = {"timestamp": int(time.time() * 1000), "reportDelay": 0,
                "userId": uid, "userNickname": nick,
-               "ideName": "WorkBuddy", "ideType": "WorkBuddy", "ideVersion": "5.5.6",
+               "ideName": "WorkBuddy", "ideType": "WorkBuddy",
+               "ideVersion": DESKTOP_VERSION_CN,
                "machineId": mid, "sessionId": derive_id(uid, "session"),
-               "mode": "CLOUD", "userAgent": UA_SHORT, "os": "Win32", "arch": "x64",
-               "osVersion": "10.0.26220", "timezone": "Asia/Shanghai",
-               "product": "SaaS", "releaseDate": 1789036585355,
-               "commit": "5f9692923c93033111c51ad7b003eb80204a9b75",
-               "extName": "workbuddy-desktop", "extVersion": "5.5.6",
-               "cpuCores": 20, "memorySize": 24}
+               "mode": "CLOUD", "userAgent": WORKBUDDY_UA_CN, "os": "Win32", "arch": "x64",
+               "osVersion": "10.0.28000", "timezone": "Asia/Shanghai",
+               "product": "SaaS", "releaseDate": DESKTOP_RELEASE_CN,
+               "commit": DESKTOP_COMMIT_CN, "qimei36": derive_id(uid, "qimei"),
+               "extName": "workbuddy-desktop", "extVersion": DESKTOP_VERSION_CN,
+               "cpuModel": "11th Gen Intel(R) Core(TM) i5-11320H @ 3.20GHz",
+               "cpuCores": 8, "memorySize": 16}
         env.update(e)
         out.append(env)
     try:
@@ -1136,6 +1162,33 @@ def _checkin_tail(s):
         return ""
 
 
+def _heatmap_today_score(s):
+    """读取成长热力图今日 score；未找到或查询失败返回 None。"""
+    try:
+        payload = s.get(
+            BASE + "/v2/activity/growth/heatmap",
+            timeout=20, verify=False).json() or {}
+        data = payload.get("data") or {}
+        today_value = data.get("today")
+        if isinstance(today_value, dict):
+            today = str(today_value.get("date") or "")[:10]
+        else:
+            today = str(today_value or "")[:10]
+        if not today:
+            today = beijing_today().isoformat()
+        for cell in data.get("cells") or []:
+            if not isinstance(cell, dict):
+                continue
+            if str(cell.get("date") or "")[:10] != today:
+                continue
+            score = cell.get("score")
+            if type(score) in (int, float):
+                return score
+        return None
+    except Exception:
+        return None
+
+
 def t_daily_activity(s, uid, nick, log):
     """点亮成长中心活跃连登。
 
@@ -1157,15 +1210,15 @@ def t_daily_activity(s, uid, nick, log):
         log("   🔥每日活跃: 今日已上报，跳过")
         return
     now = int(time.time() * 1000)
-    token = str(uuid.uuid4())
-    conv_id = "wb-daily-" + token
+    conv_id = _new_conversation_id()
+    request_id = _new_message_id()
     event = {
         "eventCode": "chat_request_send",
         "timestamp": now,
         "reportDelay": 0,
         "mode": "craft",
         "conversationId": conv_id,
-        "requestId": conv_id,
+        "requestId": request_id,
         "inputLength": 12,
         "requestModelId": "deepseek-v4-flash",
         "requestModelName": "DeepSeek V4 Flash",
@@ -1191,7 +1244,7 @@ def t_daily_activity(s, uid, nick, log):
         "fileUri": "",
         "presentAt": now,
         "traceId": "",
-        "rootRequestId": conv_id,
+        "rootRequestId": request_id,
         "parentConversationId": conv_id,
         "agentName": "default",
         "agentType": "conversation",
@@ -1203,13 +1256,38 @@ def t_daily_activity(s, uid, nick, log):
         headers={
             "Origin": CBDOMAIN,
             "Referer": CBDOMAIN + "/",
-            "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
+            "User-Agent": WORKBUDDY_UA_CN,
             "X-User-Id": uid,
             "X-Domain": "copilot.tencent.com",
         },
     )
     if status not in (200, 201):
         log("   🔥每日活跃: 上报失败 HTTP %s" % status)
+        return
+
+    # HTTP 200 只代表事件已受理，必须由热力图 score 确认真正计分。
+    score = _heatmap_today_score(s)
+    if score is None:
+        log("   🔥每日活跃: 合成事件已发送，热力图回读失败（不写本地完成标记）")
+    elif score > 0:
+        log("   🔥每日活跃: 热力图已点亮 %s 分" % score)
+    elif _env_enabled("WORKBUDDY_ACTIVITY_CHAT_FALLBACK", True):
+        log("   🔥每日活跃: 合成事件未计分，尝试一次真实对话兜底")
+        try:
+            conv_id, _reply, _message_id = webchat2(
+                s, "activity", "你好，回答OK即可")
+            if conv_id:
+                time.sleep(3)
+                score = _heatmap_today_score(s)
+                if score and score > 0:
+                    log("   🔥每日活跃: 真实对话兜底成功，热力图 %s 分" % score)
+        except Exception as exc:
+            log("   🔥每日活跃: 真实对话兜底失败 %s" % str(exc)[:60])
+    else:
+        log("   🔥每日活跃: 合成事件未计分，真实对话兜底已关闭")
+
+    if not score or score <= 0:
+        log("   🔥每日活跃: 今日计分仍未确认，下轮继续重试")
         return
     try:
         state[uid] = today
@@ -1297,9 +1375,13 @@ def t_sign(s, uid, nick, log):
         log("   ✅签到: %s%s" % (message, _checkin_tail(s)))
         t_daily_activity(s, uid, nick, log)
         return
-    if claim_code in (10001, "10001") and any(
-            marker in message_lower for marker in ("已签到", "已领取", "already")):
-        log("   ✅签到: %s%s" % (message, _checkin_tail(s)))
+    if claim_code in (10001, "10001"):
+        fresh = _checkin_status(s)
+        if fresh.get("today_checked_in") in (True, 1):
+            log("   ✅签到: 状态回读确认今日已签%s" % _checkin_tail(s))
+            t_daily_activity(s, uid, nick, log)
+            return
+        log("   ❌签到未确认: code 10001 但状态未显示今日已签 %s" % message[:60])
         t_daily_activity(s, uid, nick, log)
         return
     log("   ❌签到未确认: %s" % (
@@ -1440,7 +1522,8 @@ def _fetch_hp_theme(s):
     """
     try:
         d = s.post(BASE + "/v2/operation-platform/appearance/resources",
-                   json={"platform": "client", "kind": "theme", "version": "5.5.6", "lang": "zh-CN"},
+                   json={"platform": "client", "kind": "theme",
+                         "version": DESKTOP_VERSION_CN, "lang": "zh-CN"},
                    timeout=20, verify=False).json()
         for x in ((d.get("data") or {}).get("resources") or []):
             nm = x.get("name") or ""
@@ -1543,13 +1626,14 @@ def t_expert_5(s, uid, nick, log):
         if st in ("completed", "claimed") or (cur or 0) >= (tgt or 5):
             break
         e = experts[i % len(experts)] if experts else {"id": "expert-" + str(uuid.uuid4())[:8], "name": "Expert", "profession": ""}
+        rid = _new_message_id()
         report(s, uid, nick, [
             {"eventCode": "expert_summoned", "id": e["id"], "name": e["name"], "type": "agent",
              "expertTitle": e.get("profession", ""), "expertType": "agent"},
             {"eventCode": "expert_actual_use", "id": e["id"], "name": e["name"], "type": e.get("industryId", "") or "",
              "expertType": "agent", "source": "builtin", "version": "", "cost": 0, "characterCount": 12,
-             "conversationId": "conv-" + str(uuid.uuid4()), "requestId": str(uuid.uuid4()),
-             "messageId": "msg-" + str(uuid.uuid4()),
+             "conversationId": _new_conversation_id(), "requestId": rid,
+             "messageId": "msg-" + rid[-8:],
              "requestModelId": "deepseek-v4-flash", "requestModelName": "DeepSeek V4 Flash"}])
         time.sleep(3)
     st, cur, tgt = prog(s, "expert_5")
@@ -1581,7 +1665,7 @@ def t_template_5(s, uid, nick, log):
         st, cur, tgt = prog(s, "template_5")
         if st in ("completed", "claimed") or (cur or 0) >= (tgt or 5):
             break
-        rid = "wb2api-tpl-%d-%s" % (int(time.time() * 1000), tid)
+        rid = _new_message_id()
         report(s, uid, nick, [
             {"eventCode": "agent_task_created", "source": "CLOUD", "name": "", "mode": "craft",
              "requestModelId": "default", "action": tid, "has_template": True, "template_id": tid,
@@ -2189,9 +2273,9 @@ def t_desktop_tasks(s, uid, nick, tok, log, need_rich, need_skill):
 def _desktop_fingerprint_fallback(s, uid, nick, log, need_rich, need_skill):
     """桌面任务指纹降级：desktop_chat_sequence + skill_info 事件（task_runner 同款，无需真实桌面端）。"""
     if need_rich:
-        conv = "fp-rm-%s" % derive_id(uid, "rm-conv")
-        req = "fp-rm-req-%s" % derive_id(uid, "rm-req")
-        msg = "fp-rm-msg-%s" % derive_id(uid, "rm-msg")
+        conv = _new_conversation_id()
+        req = _new_message_id()
+        msg = _new_message_id()
         try:
             evs = desktop_chat_sequence(uid, nick, conv, req, msg)
             report_desktop_events(s, uid, nick, evs)
@@ -2227,8 +2311,8 @@ def _desktop_fingerprint_fallback(s, uid, nick, log, need_rich, need_skill):
             except Exception:
                 pass
             if not (conv_id and smid):   # 对话不可用时保住旧口径
-                conv_id = "fp-sk-%s" % derive_id(uid, "sk-conv")
-                smid = "fp-sk-%s" % derive_id(uid, "sk-mid")
+                conv_id = _new_conversation_id()
+                smid = _new_message_id()
             evs = desktop_chat_sequence(uid, nick, conv_id, smid, smid)
             for ev in evs:
                 if ev.get("eventCode") == "chat_message_response":
@@ -2718,7 +2802,8 @@ def t_lighthouse(s, uid, nick, log):
             return
     # 回落：web 域伪造链（真实对话不可用，或桌面链未点亮时）
     try:
-        rid = mid or str(uuid.uuid4()); cid = conv_id or ("conv-" + str(uuid.uuid4()))
+        rid = mid or _new_message_id()
+        cid = conv_id or _new_conversation_id()
         report(s, uid, nick, [{
             "eventCode": "expert_summoned", "id": lh["id"], "name": lh["name"],
             "type": "agent", "expertTitle": lh["name"], "expertType": "agent",
@@ -2814,8 +2899,8 @@ def t_valorant(s, uid, nick, log):
             log("   无畏契约拼豆专家: %s %s/%s" % (st, cur, tgt))
             return
     try:
-        request_id = mid or str(uuid.uuid4())
-        conversation_id = conv_id or ("conv-" + str(uuid.uuid4()))
+        request_id = mid or _new_message_id()
+        conversation_id = conv_id or _new_conversation_id()
         report(s, uid, nick, [
             {"eventCode": "expert_summoned", "id": expert["id"], "name": expert["name"],
              "type": "agent", "expertTitle": expert["name"], "expertType": "agent",
@@ -2856,13 +2941,12 @@ def mp_machine_id(uid):
 def mp_base(uid, nick):
     """小程序埋点公共指纹（对齐官方源码 module 22015 的 wQ()+Ao()）。
 
-    源码常量（module 25439）：ideVersion/extVersion = 小程序包版本 2.2.8（恒定值，不是
-    SaaS 状态）；os/osVersion/arch 取 getDeviceInfo() 运行值——这里固定成一份真实安卓机
-    指纹（android 14 / arm64），与 mp_mini_expert_event、上游 task_runner 同口径。
+    公共 base 的 ideVersion/extVersion 使用当前小程序包版本 2.4.0；个别事件
+    （专家/灵感）仍按官方发射点保留 2.2.8。os/osVersion/arch 取一份真实安卓机指纹。
     """
     now = int(time.time() * 1000)
-    return {"timestamp": now, "ideType": "WorkBuddy_MP", "ideVersion": "2.2.8",
-            "extName": "workbuddy-mp", "extVersion": "2.2.8", "product": "SaaS",
+    return {"timestamp": now, "ideType": "WorkBuddy_MP", "ideVersion": "2.4.0",
+            "extName": "workbuddy-mp", "extVersion": "2.4.0", "product": "SaaS",
             "ideName": "wx_app_cloud", "platform": "mini_program",
             "source": "mini_program",   # 官方源码口径：mp 身份 = wx_app_cloud + WorkBuddy_MP + source
             "os": "android", "osVersion": "14", "arch": "arm64",
@@ -2872,8 +2956,9 @@ def mp_base(uid, nick):
 
 def mp_chat_event(uid, nick, conv_id, activity_id=None):
     """小程序 chat_request_send 事件（chat_3_times / school_season / Sequential_Tasks_1 判据）。"""
-    # 官方源码（growth 模块 86692）：conversationId / requestId / traceId 同值传递
-    rid = conv_id
+    # 官方真机：conversationId 为 UUID v4；requestId 为 32 hex 时间前缀 ID。
+    conv_id = conv_id or _new_conversation_id()
+    rid = _new_message_id()
     ev = {"eventCode": "chat_request_send", "mode": "chat", "inputLength": 12, "isPlan": False,
           "isAutoExecuteTerminal": False, "isAutoModify": False, "codebaseEnable": False,
           "maxToken": 0, "maxSteps": 500, "temperature": 0, "maxRetries": 0,
@@ -2895,7 +2980,7 @@ def mp_expert_use_events(uid, nick, expert_id, expert_name, conv_id, activity_id
 
     链：expert_summon_click → expert_summoned → expert_actual_use → chat_request_send
     """
-    rid = "wb2api-" + str(uuid.uuid4())
+    rid = _new_message_id()
     cat = MP_EXPERT_CATEGORY
     evs = [
         {"eventCode": "expert_summon_click", "id": expert_id, "name": expert_id,
@@ -2934,7 +3019,7 @@ def mp_model_chat_event(uid, nick, conv_id, model_id="glm-5.2", model_name="GLM-
 
 def mp_playbook_events(uid, nick, case_id="01-ProductDesign", case_name="产品设计"):
     """Sequential_Tasks_7 判据：mp 指纹 playbook_cta_click + playbook_prompt_send。"""
-    conv = "wb2api-mp-pb-" + str(uuid.uuid4())
+    conv = _new_conversation_id()
     base = {"id": case_id, "name": case_name, "type": "document",
             "categoryId": "", "categoryName": "", "skills": "", "skillNames": ""}
     cta = dict(base, eventCode="playbook_cta_click", source="discover", position=1, extVersion="2.2.8")
@@ -3169,10 +3254,10 @@ def _mp_do_task(s, uid, nick, code, log, events_fn, label, target=1, pace=False)
         log("   %s: 失败 %s" % (label, str(e)[:60]))
 
 
-def _mp_chat_evs(uid, nick, prefix, activity_id=None):
+def _mp_chat_evs(uid, nick, activity_id=None):
     """返回一个 events_fn(i)：每次产出一条 mini 对话事件（独立 conversationId）。"""
     def _fn(i):
-        return [mp_chat_event(uid, nick, "%s-%s-%d" % (prefix, uuid.uuid4(), i),
+        return [mp_chat_event(uid, nick, _new_conversation_id(),
                               activity_id=activity_id)]
     return _fn
 
@@ -3180,7 +3265,7 @@ def _mp_chat_evs(uid, nick, prefix, activity_id=None):
 def t_sequential_tasks(s, uid, nick, log):
     """小程序成长任务 Sequential_Tasks_1：完成 1 次对话（+100c+5e）"""
     _mp_do_task(s, uid, nick, "Sequential_Tasks_1", log,
-                _mp_chat_evs(uid, nick, "wbmp"), "小程序对话任务", target=1, pace=True)
+                _mp_chat_evs(uid, nick), "小程序对话任务", target=1, pace=True)
 
 
 def t_sequential_tasks_2(s, uid, nick, log):
@@ -3202,7 +3287,7 @@ def t_sequential_tasks_3(s, uid, nick, log):
     判据与 Tasks_1 同形状（mini chat_request_send 无 activityId），按上报条数累加。
     """
     _mp_do_task(s, uid, nick, "Sequential_Tasks_3", log,
-                _mp_chat_evs(uid, nick, "wbmp3"), "小程序对话×5", target=5, pace=True)
+                _mp_chat_evs(uid, nick), "小程序对话×5", target=5, pace=True)
 
 
 def t_sequential_tasks_4(s, uid, nick, log):
@@ -3227,7 +3312,7 @@ def t_sequential_tasks_4(s, uid, nick, log):
     # 回落：桌面域 automation 事件（旧口径，实测同样能点亮）
     try:
         report_desktop_events(s, uid, nick, [{
-            "eventCode": "automated_task_create_suc", "name": "wb2api 定时任务",
+            "eventCode": "automated_task_create_suc", "name": "定时任务",
             "source": "manually", "modelId": "fast-model", "modelIsThinking": True,
             "connectorCount": 0, "skills": "", "skillCount": 0,
             "scheduleType": "once", "mode": "LOCAL"}])
@@ -3246,14 +3331,14 @@ def t_sequential_tasks_4(s, uid, nick, log):
 def t_sequential_tasks_5(s, uid, nick, log):
     """小程序成长任务 Sequential_Tasks_5：使用 1 次 GLM5.2 模型（+100c+5e）"""
     def _evs(i):
-        return [mp_model_chat_event(uid, nick, "wbmp5-%s-%d" % (uuid.uuid4(), i))]
+        return [mp_model_chat_event(uid, nick, _new_conversation_id())]
     _mp_do_task(s, uid, nick, "Sequential_Tasks_5", log, _evs, "小程序GLM5.2", target=1, pace=True)
 
 
 def t_sequential_tasks_6(s, uid, nick, log):
     """小程序成长任务 Sequential_Tasks_6：完成 10 次对话（target 以服务端下发为准）"""
     _mp_do_task(s, uid, nick, "Sequential_Tasks_6", log,
-                _mp_chat_evs(uid, nick, "wbmp6"), "小程序对话×10", target=10, pace=True)
+                _mp_chat_evs(uid, nick), "小程序对话×10", target=10, pace=True)
 
 
 def t_sequential_tasks_7(s, uid, nick, log):
@@ -3397,13 +3482,15 @@ def desktop_fingerprint(uid, nick):
     return {
         "timezone": "Asia/Shanghai", "reportDelay": 2000,
         "userId": uid, "username": nick, "userNickname": nick,
-        "product": "SaaS", "releaseDate": 1789036585355,
-        "commit": "5f9692923c93033111c51ad7b003eb80204a9b75",
-        "ideName": "WorkBuddy", "ideType": "WorkBuddy", "ideVersion": "5.5.6",
+        "product": "SaaS", "releaseDate": DESKTOP_RELEASE_CN,
+        "commit": DESKTOP_COMMIT_CN, "qimei36": derive_id(uid, "qimei"),
+        "ideName": "WorkBuddy", "ideType": "WorkBuddy",
+        "ideVersion": DESKTOP_VERSION_CN,
         "machineId": derive_id(uid, "machine"), "sessionId": derive_id(uid, "session"),
-        "extName": "workbuddy-desktop", "extVersion": "5.5.6",
-        "os": "win32", "arch": "x64", "osVersion": "10.0.26220",
-        "cpuCores": 20, "memorySize": 24,
+        "extName": "workbuddy-desktop", "extVersion": DESKTOP_VERSION_CN,
+        "os": "win32", "arch": "x64", "osVersion": "10.0.28000",
+        "cpuModel": "11th Gen Intel(R) Core(TM) i5-11320H @ 3.20GHz",
+        "cpuCores": 8, "memorySize": 16,
         "timestamp": now, "presentAt": now,
     }
 
@@ -3504,7 +3591,7 @@ def desktop_buddy5_sequence(uid, nick, buddy_id, buddy_name):
     return ev
 
 
-DESKTOP_UA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+DESKTOP_UA = WORKBUDDY_UA_CN
 DESKTOP_BASE = "https://copilot.tencent.com"
 
 
@@ -3524,8 +3611,8 @@ def report_desktop_events(s, uid, nick, events):
            "Accept": "application/json, text/plain, */*",
            "Content-Type": "application/json;charset=UTF-8",
            "User-Agent": DESKTOP_UA,
-           "X-Domain": DESKTOP_BASE, "X-Product": "SaaS",
-           "X-Request-ID": derive_id(uid, "req") + str(int(time.time() * 1000) % 1000000)}
+           "X-Domain": "copilot.tencent.com", "X-Product": "SaaS",
+           "X-Request-ID": _new_message_id()}
     if uid:
         hdr["X-User-Id"] = uid
     s2 = requests.Session(); s2.trust_env = False

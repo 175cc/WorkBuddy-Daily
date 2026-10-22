@@ -1,5 +1,15 @@
 # 更新日志
 
+## v3.16（2026-10-22）
+
+- 按 10-22 双版本真机抓包，清理任务上报体中的 `wb2api-*`、`wbmp-*`、`wb-daily-*` 等自证前缀。
+- 会话 ID 改为官方形态：`conversationId` 使用 UUID v4，`requestId` 使用 32 hex 毫秒前缀 ID；小程序/桌面合成事件同步修正。
+- 桌面指纹对齐国内版 5.8.3：更新 UA、ideVersion/extVersion、commit、releaseDate、osVersion、CPU 型号/核数和内存，并补 `qimei36`。
+- 桌面 `/v2/report` 的 `X-Domain` 改为裸主机名 `copilot.tencent.com`，`X-Request-ID` 改为官方 32 hex 形态。
+- 小程序公共 base 版本更新到 2.4.0；专家/灵感事件仍按官方发射点保留 2.2.8。
+- 每日活跃改为以热力图 `score > 0` 为成功判据；HTTP 200 不再直接写当天完成标记。未计分时默认补一次真实对话再回读，仍失败则下轮重试。
+- 签到业务码 `10001` 改为先回读 `today_checked_in`，只有状态确认已签才报成功。
+
 ## v3.15（2026-10-21）
 
 - 领奖改为按 `progress.current >= progress.target` 扫描，修复任务已达标但 `accept_status` 尚未变为 `completed` 时永远不领的问题。
