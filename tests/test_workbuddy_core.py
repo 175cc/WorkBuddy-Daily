@@ -11,6 +11,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
@@ -23,6 +24,16 @@ FUNCTIONS = {
     for node in TREE.body
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
 }
+
+
+def assignment_value(name):
+    for node in TREE.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(isinstance(target, ast.Name) and target.id == name
+               for target in node.targets):
+            return ast.literal_eval(node.value)
+    raise KeyError(name)
 
 
 def load_functions(*names, **globals_):
@@ -117,6 +128,7 @@ class CoreBehaviorTests(unittest.TestCase):
             BASE="https://example.test",
             MP_HEADER={"X-Client-Platform": "miniprogram"},
             MP_TASK_CODES=set(),
+            DESKTOP_ONLY_TASK_CODES=set(),
             time=type("Time", (), {"sleep": staticmethod(sleep_calls.append)}),
         )
         session = Session()
@@ -320,6 +332,7 @@ class CoreBehaviorTests(unittest.TestCase):
             BASE="https://example.test",
             MP_HEADER={"X-Client-Platform": "miniprogram"},
             MP_TASK_CODES=set(),
+            DESKTOP_ONLY_TASK_CODES=set(),
             time=type("Time", (), {"sleep": staticmethod(lambda seconds: None)}),
         )
         session = Session()
@@ -541,6 +554,194 @@ class CoreBehaviorTests(unittest.TestCase):
         encoded = json.dumps(event, ensure_ascii=False)
         for prefix in ("wb2api", "wbmp", "wb-daily", "fp-"):
             self.assertNotIn(prefix, encoded)
+
+    def test_expert_mapping_parser_and_dynamic_jump_url_override(self):
+        expected = {
+            "expert_use_maidehao": ("ex_GDl31WahyIH0", "中国电商运营专家"),
+            "expert_use_douyinyin": ("ex_FbY5nlWTqDod", "抖音策略师"),
+            "expert_use_shangjia_xuanchuan":
+                ("ex_Weo3x2EZuSDm", "商家宣传页与海报设计师"),
+            "expert_use_bowangwang": ("ex_WZY136wV5aMt", "直播电商教练"),
+        }
+        specs = assignment_value("EXPERT_TASK_SPECS")
+        names = assignment_value("TASK_NAME_CN")
+        self.assertEqual(set(expected), set(specs))
+        for code, (expert_id, name) in expected.items():
+            self.assertEqual(expert_id, specs[code]["id"])
+            self.assertEqual(name, specs[code]["name"])
+            self.assertEqual(name, names[code])
+        self.assertEqual("1.0.1", specs["expert_use_maidehao"]["version"])
+
+        module = load_functions(
+            "_parse_expert_deeplink", "_expert_id_from_jump_url",
+            parse_qs=parse_qs, urlparse=urlparse, re=re,
+            _EXPERT_ID_RE=re.compile(r"^ex_[A-Za-z0-9]{6,64}$"),
+            _TRUSTED_JUMP_HOST_SUFFIXES=(
+                "workbuddy.cn", "codebuddy.cn", "tencent.com"),
+        )
+        direct = "workbuddy://experts?expertId=ex_GDl31WahyIH0"
+        wrapped = (
+            "https://www.workbuddy.cn/jump?deeplink="
+            "workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_FbY5nlWTqDod"
+        )
+        bare_parameter = (
+            "deeplink=workbuddy://experts?expertId=ex_Weo3x2EZuSDm"
+        )
+        self.assertEqual("ex_GDl31WahyIH0",
+                         module["_expert_id_from_jump_url"](direct))
+        self.assertEqual("ex_FbY5nlWTqDod",
+                         module["_expert_id_from_jump_url"](wrapped))
+        self.assertEqual("ex_Weo3x2EZuSDm",
+                         module["_expert_id_from_jump_url"](bare_parameter))
+        invalid = [
+            "https://evil.test/ex_GDl31WahyIH0",
+            "https://evil.test/?next=workbuddy://experts?expertId=ex_GDl31WahyIH0",
+            "https://evil.test/?deeplink=workbuddy://experts?expertId=ex_GDl31WahyIH0",
+            "https://evil.test/?deeplink=https://evil.test/?expertId=ex_GDl31WahyIH0",
+            "workbuddy://experts/other?expertId=ex_GDl31WahyIH0",
+            "workbuddy://experts?expertId=not_an_expert",
+            "workbuddy://experts?expertId=ex_GDl31WahyIH0&expertId=ex_FbY5nlWTqDod",
+        ]
+        for value in invalid:
+            self.assertEqual("", module["_expert_id_from_jump_url"](value), value)
+
+        class Session:
+            def get(self, url, **kwargs):
+                return FakeResponse(payload={
+                    "data": {"tasks": [{
+                        "task_code": "expert_use_maidehao",
+                        "jump_url":
+                            "workbuddy://experts?expertId=ex_Rotated12345",
+                    }]},
+                })
+
+        integration = load_functions(
+            "_parse_expert_deeplink", "_expert_id_from_jump_url",
+            "_growth_task_row", "_expert_spec_for_task",
+            parse_qs=parse_qs, urlparse=urlparse, re=re,
+            _EXPERT_ID_RE=re.compile(r"^ex_[A-Za-z0-9]{6,64}$"),
+            _TRUSTED_JUMP_HOST_SUFFIXES=(
+                "workbuddy.cn", "codebuddy.cn", "tencent.com"),
+            EXPERT_TASK_SPECS=specs,
+            BASE="https://example.test",
+        )
+        spec = integration["_expert_spec_for_task"](
+            Session(), "expert_use_maidehao")
+        self.assertEqual("ex_Rotated12345", spec["id"])
+        self.assertEqual("中国电商运营专家", spec["name"])
+
+    def test_local_expert_flow_uses_real_chat_and_local_events(self):
+        states = [("accepted", 0, 1), ("completed", 1, 1), ("completed", 1, 1)]
+        captured = {}
+
+        def webchat2(session, name, prompt, meta):
+            captured["meta"] = meta
+            return "conv-1", "OK", "cmb-0123456789abcdef0123456789abcdef"
+
+        def report_desktop_events(session, uid, nick, events):
+            captured["events"] = events
+            return 200
+
+        module = load_functions(
+            "_run_local_expert_task",
+            re=re, uuid=uuid, json=json,
+            time=type("Time", (), {
+                "time": staticmethod(time.time),
+                "sleep": staticmethod(lambda seconds: None),
+            }),
+            _EXPERT_ID_RE=re.compile(r"^ex_[A-Za-z0-9]{6,64}$"),
+            prog=lambda session, code: states.pop(0),
+            get_normal_experts=lambda count: [{
+                "id": "ex_Dynamic12345",
+                "name": "抖音策略师",
+                "version": "1.0.9",
+            }],
+            webchat2=webchat2,
+            desktop_chat_sequence=lambda uid, nick, conv, req, msg: [{
+                "eventCode": "agent_task_created",
+                "conversationId": conv,
+                "requestId": req,
+            }],
+            report_desktop_events=report_desktop_events,
+            report=lambda *args, **kwargs: 200,
+            _new_message_id=lambda: "fallback-message",
+            _new_conversation_id=lambda: "fallback-conversation",
+        )
+        logs = []
+        module["_run_local_expert_task"](
+            object(), "uid-1", "nick", logs.append, "expert_use_douyinyin",
+            {"id": "ex_Dynamic12345", "name": "抖音策略师",
+             "version": "1.0.0", "slug": "douyinyin"},
+            conv_name="expert-douyinyin",
+        )
+        actual = [event for event in captured["events"]
+                  if event.get("eventCode") == "expert_actual_use"][-1]
+        created = [event for event in captured["events"]
+                   if event.get("eventCode") == "agent_task_created"][0]
+        self.assertEqual("ex_Dynamic12345", actual["id"])
+        self.assertEqual("LOCAL", actual["mode"])
+        self.assertEqual("1.0.9", actual["version"])
+        self.assertTrue(created["has_expert"])
+        self.assertEqual("ex_Dynamic12345", created["expert_id"])
+        self.assertEqual("ex_Dynamic12345",
+                         captured["meta"]["codebuddy.ai"]["expertId"])
+        self.assertIn("completed 1/1", " ".join(logs))
+
+    def test_expert_use_tasks_claim_on_desktop_even_when_mp_rows_exist(self):
+        codes = {
+            "expert_use_maidehao",
+            "expert_use_douyinyin",
+            "expert_use_shangjia_xuanchuan",
+            "expert_use_bowangwang",
+        }
+        desktop_tasks = {
+            "data": {"tasks": [{
+                "task_code": code,
+                "accept_status": "accepted",
+                "progress": {"current": 1, "target": 1},
+            } for code in sorted(codes)]},
+        }
+        mp_tasks = {
+            "data": {"tasks": [{
+                "task_code": code,
+                "accept_status": "accepted",
+                "progress": {"current": 1, "target": 1},
+            } for code in sorted(codes)]},
+        }
+
+        class Session:
+            def __init__(self):
+                self.posts = []
+
+            def get(self, url, **kwargs):
+                return FakeResponse(
+                    payload=mp_tasks if kwargs.get("headers") else desktop_tasks)
+
+            def post(self, url, **kwargs):
+                self.posts.append((url, kwargs.get("headers")))
+                return FakeResponse(payload={
+                    "code": 0,
+                    "data": {"credit": 100, "energy": 5},
+                })
+
+        module = load_functions(
+            "_api_code_ok", "_claim_response_ok", "claim", "_mp_claim",
+            "claim_ready_tasks",
+            _as_int=lambda value, default=0: int(value or default),
+            BASE="https://example.test",
+            MP_HEADER={"X-Client-Platform": "miniprogram"},
+            MP_TASK_CODES=set(),
+            DESKTOP_ONLY_TASK_CODES=frozenset(codes),
+            time=type("Time", (), {"sleep": staticmethod(lambda seconds: None)}),
+        )
+        session = Session()
+        logs = []
+        module["claim_ready_tasks"](session, logs.append)
+
+        claimed = {url.rsplit("/", 2)[-2] for url, _ in session.posts}
+        self.assertEqual(codes, claimed)
+        self.assertTrue(all(headers is None for _, headers in session.posts))
+        self.assertIn("达标补领完成: 4 项", " ".join(logs))
 
     def test_desktop_fingerprint_matches_cn_current_shape(self):
         module = load_functions(
