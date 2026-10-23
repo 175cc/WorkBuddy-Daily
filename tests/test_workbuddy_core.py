@@ -194,6 +194,143 @@ class CoreBehaviorTests(unittest.TestCase):
         module["t_sign"](object(), "u1", "nick", second_logs.append)
         self.assertIn("状态回读确认今日已签", " ".join(second_logs))
 
+    def test_accept_verify_requires_positive_state_readback(self):
+        class Session:
+            def __init__(self):
+                self.posts = 0
+
+            def post(self, url, **kwargs):
+                self.posts += 1
+                return FakeResponse(payload={
+                    "code": 0,
+                    "data": {"results": [{"status": "accepted"}]},
+                })
+
+        states = [
+            (None, None, None),
+            (None, None, None),
+            ("accepted", 0, 1),
+        ]
+        module = load_functions(
+            "_accept_with_verify",
+            BASE="https://example.test",
+            WRITE_GAP=0,
+            prog=lambda session, code: states.pop(0),
+            time=type("Time", (), {"sleep": staticmethod(lambda seconds: None)}),
+        )
+        session = Session()
+        logs = []
+        self.assertFalse(module["_accept_with_verify"](session, "new_task", logs.append))
+        self.assertTrue(module["_accept_with_verify"](session, "new_task", logs.append))
+        self.assertEqual(3, session.posts)
+
+    def test_accept_all_repairs_prerequisite_then_confirms_state(self):
+        class Session:
+            def get(self, url, **kwargs):
+                return FakeResponse(payload={
+                    "code": 0,
+                    "data": {"tasks": [{
+                        "task_code": "dependent_task",
+                        "accept_status": "not_accepted",
+                    }]},
+                })
+
+            def post(self, url, **kwargs):
+                return FakeResponse(payload={
+                    "code": 0,
+                    "data": {"results": [{
+                        "task_code": "dependent_task",
+                        "status": "error",
+                        "message": "prerequisite not met: first_buddy (missing)",
+                    }]},
+                })
+
+        module = load_functions(
+            "t_accept_all",
+            BASE="https://example.test",
+            time=type("Time", (), {"sleep": staticmethod(lambda seconds: None)}),
+            prog=lambda session, code: ("accepted", 0, 1),
+            ensure_first_buddy=lambda session, uid, nick, log: True,
+            _accept_with_verify=lambda session, code, log: True,
+        )
+        logs = []
+        module["t_accept_all"](Session(), "u1", "nick", logs.append)
+        text = " ".join(logs)
+        self.assertIn("待前置「first_buddy」满足", text)
+        self.assertIn("Buddy 已就绪", text)
+        self.assertIn("全部登记生效", text)
+
+    def test_unknown_tasks_discovers_mp_rows_when_desktop_fails(self):
+        class Session:
+            def get(self, url, **kwargs):
+                if not kwargs.get("headers"):
+                    raise RuntimeError("desktop unavailable")
+                return FakeResponse(payload={
+                    "code": 0,
+                    "data": {"tasks": [{
+                        "task_code": "mp_new_task",
+                        "title": "小程序新任务",
+                        "task_desc": "完成一次动作",
+                        "accept_status": "not_accepted",
+                    }]},
+                })
+
+        module = load_functions(
+            "t_unknown_tasks",
+            BASE="https://example.test",
+            MP_HEADER={"X-Client-Platform": "miniprogram"},
+            beijing_today=lambda: __import__("datetime").date(2026, 10, 23),
+        )
+        logs = []
+        module["t_unknown_tasks"](Session(), "u1", "nick", logs.append)
+        text = " ".join(logs)
+        self.assertIn("任务发现部分口径失败", text)
+        self.assertIn("mp_new_task", text)
+        self.assertIn("未覆盖新任务", text)
+
+    def test_claim_ready_is_idempotent_across_scans(self):
+        class Session:
+            def __init__(self):
+                self.claimed = False
+                self.posts = []
+
+            def get(self, url, **kwargs):
+                status = "claimed" if self.claimed else "accepted"
+                return FakeResponse(payload={
+                    "code": 0,
+                    "data": {"tasks": [{
+                        "task_code": "chat_5",
+                        "accept_status": status,
+                        "progress": {"current": 5, "target": 5},
+                    }]},
+                })
+
+            def post(self, url, **kwargs):
+                self.posts.append((url, kwargs.get("headers")))
+                self.claimed = True
+                return FakeResponse(payload={
+                    "code": 0,
+                    "data": {"already_claimed": False, "credit": 100, "energy": 5},
+                })
+
+        module = load_functions(
+            "_api_code_ok", "_claim_response_ok", "claim", "_mp_claim",
+            "claim_ready_tasks",
+            _as_int=lambda value, default=0: int(value or default),
+            BASE="https://example.test",
+            MP_HEADER={"X-Client-Platform": "miniprogram"},
+            MP_TASK_CODES=set(),
+            time=type("Time", (), {"sleep": staticmethod(lambda seconds: None)}),
+        )
+        session = Session()
+        first_logs = []
+        second_logs = []
+        module["claim_ready_tasks"](session, first_logs.append)
+        module["claim_ready_tasks"](session, second_logs.append)
+        self.assertEqual(1, len(session.posts))
+        self.assertIn("达标补领完成: 1 项", " ".join(first_logs))
+        self.assertIn("无达标未领奖励", " ".join(second_logs))
+
     def test_travel_claim_uses_record_id_and_real_reward(self):
         response_queue = [
             FakeResponse(payload={"code": 0, "data": {"has_buddy": True}}),

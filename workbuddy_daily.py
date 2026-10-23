@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🌱 WorkBuddy Daily - 全能签到脚本 v3.17
+🌱 WorkBuddy Daily - 全能签到脚本 v3.18
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -128,7 +128,8 @@
    · 桌面任务：Windows 走真实桌面换血；非 Windows 自动降级为指纹上报（无需真实桌面端）
    · 夜猫子：官方规则为「每日 1 次 × 累计 3 天」，有响应即停，不空跑
    · accept 校验：解析接口逐任务状态 + 回读验证，未落账的自动逐个重试
-   · 进度补领：桌面与小程序任务都按 progress 达标补领，不依赖会延迟/回滚的 accept_status
+   · 进度补领：任务动作前先预扫一次，全部完成后再次清扫；桌面与小程序都按 progress
+     达标补领，不依赖会延迟/回滚的 accept_status
    · 签到判定：先查 activity-status，仅在活动期且今日未签时领取；空回执不再写成成功
    · 前置依赖：accept 报 prerequisite not met 时先补跑前置任务（如先领养首只 Buddy）再重试
    · 真实会话 id：专家/技能任务的 requestId/messageId 取自真实对话的服务端消息 id（cmb- 形态）
@@ -1509,8 +1510,13 @@ def t_accept_all(s, uid, nick, log):
     ⚠️ 部分任务带前置条件：message 为 `prerequisite not met: <task_code>`（如 first_buddy
        表示该账号还没有 Buddy 实例），此时先补跑前置任务再重试登记。
     """
-    r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False).json()
-    todo = [t.get("task_code") for t in r.get("data", {}).get("tasks", [])
+    try:
+        r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False).json()
+        rows = (r.get("data") or {}).get("tasks") or []
+    except Exception as e:
+        log("   📋批量接受读取任务失败: %s" % str(e)[:60])
+        return
+    todo = [t.get("task_code") for t in rows
             if isinstance(t, dict) and t.get("accept_status") == "not_accepted"]
     if not todo:
         return
@@ -3462,10 +3468,11 @@ def t_sequential_tasks_7(s, uid, nick, log):
 
 
 def t_unknown_tasks(s, uid, nick, log):
-    """任务列表体检：未覆盖的新任务提示 + 未完成任务的有效期预警
+    """任务列表体检：动态发现新任务 + 未完成任务的有效期预警
 
     服务端任务行带 valid_start / valid_end（如 Buddy_App_QQ 至 2026-10-10）——
     过期后就领不到了，所以对「未完成且 7 天内到期 / 已过期」的任务给出 ⏰ 提示。
+    默认与小程序口径都扫描，按 task_code 去重；单侧失败不阻断另一侧或后续补领。
     """
     known = {"create_canvas", "playbook_prompt", "RichMeow_Chat", "Library_read", "Expert_lighthouse",
              "Expert_Philanthropy", "Hp_Appearance", "Buddy_App", "Buddy_App_QQ", "Model_chat_GLM5.2",
@@ -3474,8 +3481,28 @@ def t_unknown_tasks(s, uid, nick, log):
              "Sequential_Tasks_1", "Sequential_Tasks_2", "Sequential_Tasks_3",
              "Sequential_Tasks_4", "Sequential_Tasks_5",
              "Sequential_Tasks_6", "Sequential_Tasks_7"}
-    r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False).json()
-    rows = r.get("data", {}).get("tasks", [])
+    rows_by_code = {}
+    errors = []
+    for headers, label in ((None, "桌面"), (MP_HEADER, "小程序")):
+        try:
+            r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False,
+                      headers=headers).json()
+            batch = (r.get("data") or {}).get("tasks") or []
+        except Exception as e:
+            errors.append("%s: %s" % (label, str(e)[:50]))
+            continue
+        for t in batch:
+            if not isinstance(t, dict):
+                continue
+            code = str(t.get("task_code") or "").strip()
+            if code and code not in rows_by_code:
+                rows_by_code[code] = t
+    if errors:
+        log("   ⚠️任务发现部分口径失败: %s" % "；".join(errors))
+    rows = list(rows_by_code.values())
+    if not rows:
+        log("   ⚠️任务发现未取得任何任务行")
+        return
     for t in rows:
         if not isinstance(t, dict):
             continue
@@ -3571,7 +3598,11 @@ def claim_ready_tasks(s, log):
         if not item["claimable"]:
             continue
         use_mp = bool(item["mp"] or code in MP_TASK_CODES)
-        ok = _mp_claim(s, code, log) if use_mp else claim(s, code, log)
+        try:
+            ok = _mp_claim(s, code, log) if use_mp else claim(s, code, log)
+        except Exception as exc:
+            ok = False
+            log("   ⚠️领奖[%s]异常: %s" % (code, str(exc)[:60]))
         if ok:
             claimed += 1
         time.sleep(1)
@@ -3763,8 +3794,9 @@ def _accept_with_verify(s, code, log):
         except Exception:
             pass
         t = prog(s, code)
-        ast = t[0] if t else "not_accepted"
-        ok = (r.status_code == 200 and status == "accepted" and ast != "not_accepted")
+        ast = t[0] if t else None
+        ok = (r.status_code == 200 and status == "accepted"
+              and ast in ("accepted", "completed", "claimed"))
         if ok:
             return True
         if attempt > 1:
@@ -3863,6 +3895,13 @@ def run_account(idx, acc, do_desktop):
         % (prof.get("level", "?"), summary["checkin_streak"], streak.get("days", "?"), energy, signed))
     if QUERY_ONLY:
         return msgs, {"idx": idx, "note": acc.get("note", ""), "done": 0, "total": 0, "rest": [], "level": "?", "energy": "?"}
+    # 先补领一次，避免后续动作处理器看到 completed/claimed 就直接跳过；
+    # 全部动作结束后还会再扫一次，收取本轮新达标的奖励。
+    log("  🎁 ── 领奖预扫 ──")
+    try:
+        claim_ready_tasks(s, log)
+    except Exception as e:
+        log("   ⚠️领奖预扫异常: %s" % str(e)[:80])
     # 桌面任务先做（新账号必须先有真实桌面会话，否则接受会被回滚、遥测不计数）
     need_rich = prog(s, "RichMeow_Chat")[0] not in ("completed", "claimed")
     need_skill = prog(s, "skill_1")[0] not in ("completed", "claimed")
@@ -3943,7 +3982,10 @@ def run_account(idx, acc, do_desktop):
     _run("抽奖", ["lottery"], lambda: t_lottery(s, uid, nick, log))
     _run("礼包/补偿", ["gift"], lambda: t_gift_compensation(s, uid, nick, log))
     _run("工作台搭建师", ["workstation_expert"], lambda: t_workstation(s, uid, nick, log, tok))
-    t_unknown_tasks(s, uid, nick, log)   # 未覆盖任务检测不受过滤影响
+    try:
+        t_unknown_tasks(s, uid, nick, log)   # 未覆盖任务检测不受过滤影响
+    except Exception as e:
+        log("   ⚠️任务发现异常: %s" % str(e)[:80])
     # 领奖：按进度补领，不依赖 accept_status 的瞬时状态
     log("  🎁 ── 领奖 ──")
     claim_ready_tasks(s, log)
