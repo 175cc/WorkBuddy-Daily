@@ -377,6 +377,70 @@ class CoreBehaviorTests(unittest.TestCase):
         self.assertEqual([], claimed)
         self.assertIn("进度未点亮", " ".join(logs))
 
+    def test_mp_task_target_zero_waits_without_fake_progress(self):
+        reported = []
+        claimed = []
+        module = load_functions(
+            "_mp_do_task", "_wait_mp_target",
+            _mp_task_row=lambda session, code: {
+                "task_code": code,
+                "accept_status": "accepted",
+                "progress": {"current": 0, "target": 0},
+            },
+            _mp_prog=lambda session, code: ("accepted", 0, 0),
+            _mp_claim=lambda session, code, log:
+                claimed.append(code) or True,
+            mp_report=lambda session, uid, nick, events:
+                reported.append(events) or 200,
+            time=type("Time", (), {
+                "sleep": staticmethod(lambda seconds: None),
+            }),
+            MP_TARGET_WAIT_ROUNDS=2,
+            MP_TARGET_WAIT_SECONDS=0,
+            WRITE_GAP=0,
+            MP_CHAT_GAP=0,
+        )
+        logs = []
+        module["_mp_do_task"](
+            object(), "uid", "nick", "Sequential_Tasks_6", logs.append,
+            lambda index: [{"eventCode": "chat_request_send"}],
+            "小程序对话×10", target=10,
+        )
+        self.assertEqual([], reported)
+        self.assertEqual([], claimed)
+        self.assertIn("不按 1 冒领", " ".join(logs))
+
+    def test_401_refresh_helper_updates_state_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "wb_refresh_tokens.json")
+            module = load_functions(
+                "_refresh_account_once",
+                os=os, json=json,
+                time=type("Time", (), {
+                    "strftime": staticmethod(lambda fmt: "2026-10-27 12:00"),
+                }),
+                REFRESH_STORE=store_path,
+                refresh_one=lambda rt: ("new-access", "new-refresh"),
+                jwt_user=lambda token: "user-1",
+                _rebuild_token_file=lambda store: None,
+            )
+            account = {
+                "note": "old-note",
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+            }
+            logs = []
+            self.assertTrue(
+                module["_refresh_account_once"](account, logs.append))
+            self.assertEqual("new-access", account["access_token"])
+            self.assertEqual("new-refresh", account["refresh_token"])
+            self.assertEqual("user-1", account["note"])
+            with open(store_path, encoding="utf-8") as handle:
+                store = json.load(handle)
+            self.assertEqual(
+                "new-refresh", store["user-1"]["refresh_token"])
+            self.assertIn("已续期一次", " ".join(logs))
+
     def test_claim_ready_is_idempotent_across_scans(self):
         class Session:
             def __init__(self):
