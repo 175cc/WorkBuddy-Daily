@@ -165,7 +165,7 @@
    · locked 任务：任务行 locked=true（未到上线时间）直接跳过并给出解锁日，不空跑不误判
    · mp 对话 id：conversationId=UUID v4；requestId/traceId/rootRequestId=32 hex 毫秒前缀
    · 瞬时错误重试：每日签到/余额/用量对网络与 5xx 做 2s/4s 有界重试，业务错误不重试
-   · 凭据体检：续期前本地看 RT/AT 结构与签发域（typ=Offline / codebuddy.cn realm），
+   · 凭据体检：续期前本地看 RT/AT 结构与签发域（typ=Offline / 国内 realm），
      把 12153 token format error 提前翻译成“粘反了 / 粘错了文件 / 截断了”
    · 微信关注任务：需真人扫码关注满 24 小时，脚本识别并提示，不自动完成
    · 推送渠道：PushPlus / Bark / WxPusher / Server酱 / 企业微信 / 钉钉 / 青龙默认通知，配了哪个推哪个（都没配只提示）
@@ -615,7 +615,7 @@ def _token_sanity(rt, at):
     """凭据本地体检：把 RT/AT 的结构问题翻译成可执行的排障提示（不联网）。
 
     合法 CN WorkBuddy 凭据（实测 2026-09-28）：
-      · AT：RS256 JWT，typ=Bearer，iss=https://www.codebuddy.cn/auth/realms/copilot
+      · AT：RS256 JWT，typ=Bearer，iss 为 codebuddy.cn 或 workbuddy.cn 的 copilot realm
       · RT：HS512 JWT，typ=Offline，iss/aud 同为上述 realm，azp=console
     服务端对不合规凭据只回一句 12153 ... token format error，这里提前说清楚是哪一种。
     """
@@ -639,8 +639,10 @@ def _token_sanity(rt, at):
                 typ, "很可能把 AT 粘到了 RT 位置，正确顺序是 手机号:AT:RT" if typ == "Bearer" else "字段粘错了"))
         if name == "AT" and typ and typ != "Bearer":
             tips.append("AT 的 typ=%s（应为 Bearer）——AT/RT 可能写反了" % typ)
-        if iss and ("codebuddy.cn" not in iss):
-            tips.append("%s 的签发域是 %s，不是 CN 站（www.codebuddy.cn/auth/realms/copilot）——国际版/其他应用的 token 在 CN 刷不了" % (name, iss[:70]))
+        if iss and iss not in (
+                "https://www.codebuddy.cn/auth/realms/copilot",
+                "https://www.workbuddy.cn/auth/realms/copilot"):
+            tips.append("%s 的签发域是 %s，不在已知的国内 WorkBuddy 签发域中，请核对凭据来源" % (name, iss[:70]))
     return tips
 
 
