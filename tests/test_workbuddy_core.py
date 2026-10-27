@@ -1,4 +1,5 @@
 import ast
+import base64
 import contextlib
 import hashlib
 import io
@@ -83,6 +84,28 @@ class FakeSession:
 
 
 class CoreBehaviorTests(unittest.TestCase):
+    def test_token_sanity_recognizes_domestic_issuers_without_trusting_lookalikes(self):
+        namespace = load_functions("_jwt_payload_local", "_token_sanity",
+                                   json=json, base64=base64)
+        def token(issuer, kind):
+            payload = base64.urlsafe_b64encode(json.dumps(
+                {"iss": issuer, "typ": kind}, separators=(",", ":")
+            ).encode()).decode().rstrip("=")
+            return "eyJ." + payload + ".signature"
+        sanity = namespace["_token_sanity"]
+        for issuer in ("https://www.codebuddy.cn/auth/realms/copilot",
+                       "https://www.workbuddy.cn/auth/realms/copilot"):
+            with self.subTest(issuer=issuer):
+                self.assertEqual([], sanity(token(issuer, "Offline"), token(issuer, "Bearer")))
+        for issuer in ("https://codebuddy.cn.evil.example/auth/realms/copilot",
+                       "https://www.workbuddy.cn.evil.example/auth/realms/copilot",
+                       "https://www.codebuddy.ai/auth/realms/copilot"):
+            with self.subTest(issuer=issuer):
+                self.assertTrue(any("签发域" in tip for tip in
+                                    sanity(token(issuer, "Offline"), "")))
+        self.assertTrue(any("typ=Bearer" in tip for tip in
+                            sanity(token("https://www.workbuddy.cn/auth/realms/copilot", "Bearer"), "")))
+
     def test_claim_ready_prefers_claimable_rows_and_correct_platform(self):
         desktop_tasks = {
             "code": 0,
