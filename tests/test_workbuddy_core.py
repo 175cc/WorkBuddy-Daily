@@ -464,6 +464,23 @@ class CoreBehaviorTests(unittest.TestCase):
                 "new-refresh", store["user-1"]["refresh_token"])
             self.assertIn("已续期一次", " ".join(logs))
 
+    def test_black_cat_missing_task_does_not_run_fake_chat_attempts(self):
+        chats = []
+        module = load_functions(
+            "t_black_cat",
+            prog=lambda session, code: (None, None, None),
+            within_night_window=lambda: True,
+            beijing_now=lambda: type("Now", (), {"hour": 23})(),
+            webchat=lambda *args: chats.append(args) or ("conv", "reply"),
+            time=type("Time", (), {
+                "sleep": staticmethod(lambda seconds: None),
+            }),
+        )
+        logs = []
+        module["t_black_cat"](object(), "uid", "nick", logs.append)
+        self.assertEqual([], chats)
+        self.assertIn("未下发 black_cat", " ".join(logs))
+
     def test_claim_ready_is_idempotent_across_scans(self):
         class Session:
             def __init__(self):

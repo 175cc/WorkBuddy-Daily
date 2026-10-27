@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🌱 WorkBuddy Daily - 全能签到脚本 v3.24
+🌱 WorkBuddy Daily - 全能签到脚本 v3.25
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -1999,6 +1999,9 @@ def t_chat_n(s, uid, nick, log, code, n, prompts):
 
 def t_black_cat(s, uid, nick, log):
     st, cur, tgt = prog(s, "black_cat")
+    if st is None:
+        log("   夜猫子: 当前任务列表未下发 black_cat（可能已下线），跳过")
+        return
     if st in ("completed", "claimed"):
         log("   夜猫子: 已 %s %s/%s" % (st, cur, tgt))
         return
