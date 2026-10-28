@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🌱 WorkBuddy Daily - 全能签到脚本 v3.25
+🌱 WorkBuddy Daily - 全能签到脚本 v3.26
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -1925,6 +1925,10 @@ def t_buddy_apps(s, uid, nick, log):
     """发现应用/企鹅教师助手：desktop_buddy5_sequence + report_desktop_events"""
     for task in ("Buddy_App", "Buddy_App_QQ"):
         st, cur, tgt = prog(s, task)
+        if st is None:
+            # 未下发（如 Buddy_App_QQ 已下线）→ 不发 buddyapp 五连
+            log("   %s: 当前任务列表未下发（可能已下线），跳过" % task)
+            continue
         if st in ("completed", "claimed"):
             continue
         buddy_id = QQ_TPL if "QQ" in task else "buddy-app-default"
@@ -2001,6 +2005,10 @@ def t_chat_n(s, uid, nick, log, code, n, prompts):
     """通用聊天任务: chat_5 / Model_chat_GLM5.2"""
     for i in range(n):
         st, cur, tgt = prog(s, code)
+        if st is None:
+            # 任务未下发（已下线/未开放）：继续发真实对话只会白扣积分
+            log("   %s: 当前任务列表未下发（可能已下线），跳过" % code)
+            return
         if st in ("completed", "claimed") or (cur or 0) >= (tgt or n):
             break
         conv_id, txt = webchat(s, code, prompts[i % len(prompts)])
@@ -2137,7 +2145,10 @@ def t_canvas_automation(s, uid, nick, log):
     为 wbx_design_canvas_task_create(+open) 与 playbook_cta_click/playbook_prompt_send 挂在真实
     conversationId/requestId 上；未点亮时回落旧的 web 域裸事件。自动化任务用真实 rrule 对象形状。
     """
-    if prog(s, "create_canvas")[0] not in ("completed", "claimed"):
+    canvas_st = prog(s, "create_canvas")[0]
+    if canvas_st is None:
+        log("   设计创意画布: 当前任务列表未下发（可能已下线），跳过")
+    elif canvas_st not in ("completed", "claimed"):
         def _canvas_evs(cid, mid):
             return [{"eventCode": "wbx_design_canvas_task_create", "conversationId": cid, "requestId": mid,
                      "source": "summon_keyword", "isCustomModel": False, "name": "", "inputLength": 12,
@@ -2152,7 +2163,9 @@ def t_canvas_automation(s, uid, nick, log):
                                   {"eventCode": "wbx_design_canvas_task_create"}])
             time.sleep(3)
     st, cur, tgt = prog(s, "automation_1")
-    if st not in ("completed", "claimed"):
+    if st is None:
+        log("   自动化任务: 当前任务列表未下发（可能已下线），跳过")
+    elif st not in ("completed", "claimed"):
         report(s, uid, nick, [{"eventCode": "agent_task_created", "source": "CLOUD", "name": "", "mode": "craft",
                                "requestModelId": "default", "task_mode": "automation",
                                "isAutomationBackground": True},
@@ -2168,7 +2181,10 @@ def t_canvas_automation(s, uid, nick, log):
                                "prompt": "每周五自动整理本周工作，生成一份周报。"},
                               {"eventCode": "automated_task_execute", "action": "execute"}])
         time.sleep(3)
-    if prog(s, "playbook_prompt")[0] not in ("completed", "claimed"):
+    playbook_st = prog(s, "playbook_prompt")[0]
+    if playbook_st is None:
+        log("   优秀灵感: 当前任务列表未下发（可能已下线），跳过")
+    elif playbook_st not in ("completed", "claimed"):
         def _pb_evs(cid, mid):
             payload = {"id": PLAYBOOK_CASE["id"], "name": PLAYBOOK_CASE["name"],
                        "type": PLAYBOOK_CASE["type"], "categoryId": "", "categoryName": ""}
@@ -4369,9 +4385,14 @@ def run_account(idx, acc, do_desktop):
     except Exception as e:
         log("   ⚠️领奖预扫异常: %s" % str(e)[:80])
     # 桌面任务先做（新账号必须先有真实桌面会话，否则接受会被回滚、遥测不计数）
-    need_rich = prog(s, "RichMeow_Chat")[0] not in ("completed", "claimed")
-    need_skill = prog(s, "skill_1")[0] not in ("completed", "claimed")
+    rich_st = prog(s, "RichMeow_Chat")[0]
+    skill_st = prog(s, "skill_1")[0]
+    # 未下发（None）＝该任务当前不可做：不能当「未完成」去跑桌面对话，否则白扣积分
+    need_rich = rich_st is not None and rich_st not in ("completed", "claimed")
+    need_skill = skill_st is not None and skill_st not in ("completed", "claimed")
     desktop_skipped = False
+    if rich_st is None or skill_st is None:
+        log("  🖥️ 桌面任务: 有任务未下发（RichMeow=%s skill_1=%s），未下发项不执行" % (rich_st, skill_st))
     if (need_rich or need_skill) and not want("desktop", "RichMeow_Chat", "skill_1"):
         log("  🖥️ 桌面任务: 按配置跳过（desktop）")
         need_rich = need_skill = False

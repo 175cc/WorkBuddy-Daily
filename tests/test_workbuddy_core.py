@@ -1389,5 +1389,69 @@ class CoreBehaviorTests(unittest.TestCase):
         self.assertTrue(state.get("checked_in"))
 
 
+class TaskDispatchGuardTests(unittest.TestCase):
+    """prog() 对未下发任务返回 (None, None, None)：不能当成「未完成」继续发真实请求。
+
+    issue #39：Model_chat_GLM5.2 / create_canvas / Buddy_App_QQ 已不再下发，
+    旧判断 `st not in ("completed", "claimed")` 对 None 恒为真，导致每轮白扣积分。
+    """
+
+    def test_chat_task_skips_when_not_dispatched(self):
+        webchats = []
+        logs = []
+        module = load_functions(
+            "t_chat_n", time=time,
+            prog=lambda s, code: (None, None, None),
+            webchat=lambda *a, **k: webchats.append(a) or ("cid", "txt"),
+            chat_request_events=lambda *a, **k: ([], None),
+            report=lambda *a, **k: None,
+        )
+        module["t_chat_n"](object(), "uid", "nick", logs.append,
+                           "Model_chat_GLM5.2", 1, ["你好"])
+        self.assertEqual([], webchats)
+        self.assertTrue(any("未下发" in line for line in logs))
+
+    def test_chat_task_still_runs_when_dispatched(self):
+        webchats = []
+        module = load_functions(
+            "t_chat_n", time=time,
+            prog=lambda s, code: ("", 0, 3),
+            webchat=lambda *a, **k: webchats.append(a) or ("cid", "txt"),
+            chat_request_events=lambda *a, **k: ([], None),
+            report=lambda *a, **k: None,
+        )
+        module["t_chat_n"](object(), "uid", "nick", lambda m: None, "chat_5", 1, ["你好"])
+        self.assertEqual(1, len(webchats))
+
+    def test_canvas_tasks_skip_when_not_dispatched(self):
+        desktops, reports = [], []
+        logs = []
+        module = load_functions(
+            "t_canvas_automation", time=time,
+            prog=lambda s, code: (None, None, None),
+            _desktop_run=lambda *a, **k: desktops.append(a) or True,
+            report=lambda *a, **k: reports.append(a),
+            PLAYBOOK_CASE={"id": "x", "name": "n", "type": "t"},
+            uuid=uuid,
+        )
+        module["t_canvas_automation"](object(), "uid", "nick", logs.append)
+        self.assertEqual([], desktops)
+        self.assertEqual([], reports)
+        self.assertEqual(3, len([line for line in logs if "未下发" in line]))
+
+    def test_buddy_apps_skip_when_not_dispatched(self):
+        sequences, reports = [], []
+        module = load_functions(
+            "t_buddy_apps", time=time,
+            prog=lambda s, code: (None, None, None),
+            desktop_buddy5_sequence=lambda *a, **k: sequences.append(a) or [],
+            report_desktop_events=lambda *a, **k: reports.append(a),
+            QQ_TPL="qq-tpl", WRITE_GAP=0,
+        )
+        module["t_buddy_apps"](object(), "uid", "nick", lambda m: None)
+        self.assertEqual([], sequences)
+        self.assertEqual([], reports)
+
+
 if __name__ == "__main__":
     unittest.main()
